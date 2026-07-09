@@ -35,8 +35,10 @@ AudioStreamMETER/
 │   ├── customization/
 │   │   ├── metering_standards/standards.json   # Metering standards configuration
 │   │   ├── presets/Default.csv   # Preset file for IP + Name sets with single-click recall
-│   │   └── email_template.json  # The email template for technical support communications 
+│   │   └── email_template.json  # The email template for customizable technical support communications 
 │   └── ffmpeg_bin/                 # FFmpeg binaries for InnoSetup's packaging
+|       ├── ffmpeg.exe         #downloadable from https://ffmpeg.org/download.html
+|       └── ffplay.exe        # downloadable from https://ffmpeg.org/download.html
 └── README.md
 ```
 
@@ -101,7 +103,7 @@ source .venv/bin/activate        # on Linux/macOS
 pip install -r src/requirements.txt
 ```
 
-##### 4. Install ffmpeg on your machine
+##### 4. Install ffmpeg and a Qt6 library on your machine
 
 Then in a new terminal window:
 
@@ -110,7 +112,7 @@ winget install ffmpeg           # on Windows PowerShell
 ```
 
 ```bash
-sudo apt install ffmpeg         # on Linux
+sudo apt install ffmpeg libxcb-cursor0         # on Linux
 ```
 
 Dependencies are:
@@ -120,6 +122,7 @@ Dependencies are:
 - `pyqtgraph` - Real-time graphics
 - `numpy` - Numerical processing
 - `pyloudnorm` - LUFS metering
+- `libxcb-cursor0` - Qt/X11 cursor support on Linux
 
 ---
 
@@ -135,14 +138,12 @@ pip install pyinstaller
 
 ##### 2. Download and Add FFmpeg
 
-Copy `ffmpeg.exe` and `ffplay.exe` to the ffmpeg_bin folder:
+Copy `ffmpeg.exe` and `ffplay.exe` to the ffmpeg_bin folder(inside the Windows folder):
 
 ```text
-Windows/dist/AudioStreamMETER/
-├── AudioStreamMETER.exe
-├── ffmpeg.exe
-├── ffplay.exe
-└── _internal/
+/Windows/ffmpeg_bin/
+         ├── ffmpeg.exe
+         └── ffplay.exe
 ```
 
 > You can download FFmpeg from [gyan.dev](https://www.gyan.dev/ffmpeg/builds/) or [BtbN](https://github.com/BtbN/FFmpeg-Builds/releases)

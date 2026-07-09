@@ -35,7 +35,9 @@ AudioStreamMETER/
 │   │   ├── metering_standards/standards.json   # File per richiamare gli standard di misurazione
 │   │   ├── presets/Default.csv   # File per richiamare set di IP + Nome corrisponente + email supporto tecnico
 │   │   └── email_template.json  # File per personalizzare il Template della Email da inviare al supporto tecnico dello stream corrispondente
-│   └── ffmpeg_bin/                 # Binari FFmpeg per packaging con InnoSetup
+│   └── ffmpeg_bin/             # Binari FFMPEG per packaging con InnoSetup
+|       ├── ffmpeg.exe       # scaricabile da https://ffmpeg.org/download.html
+|       └── ffplay.exe       # scaricabile da https://ffmpeg.org/download.html
 └── README.md
 ```
 
@@ -100,7 +102,7 @@ source .venv/bin/activate        # su Linux/macOS
 pip install -r src/requirements.txt
 ```
 
-##### 4. Installa ffmpeg sulla macchina
+##### 4. Installa ffmpeg e una dipendenza Qt6 sulla macchina
 
 poi in una finestra di terminale nuova:
 
@@ -109,7 +111,7 @@ winget install ffmpeg           # su Windows PowerShell
 ```
 
 ```bash
-sudo apt install ffmpeg         # su Linux
+sudo apt install ffmpeg libxcb-cursor0         # su Linux
 ```
 
 Le dipendenze sono:
@@ -119,6 +121,7 @@ Le dipendenze sono:
 - `pyqtgraph` - Grafici real-time
 - `numpy` - Elaborazione numerica
 - `pyloudnorm` - Misurazione LUFS
+- `libxcb-cursor0` - supporto cursore Qt/X11 su Linux
 
 ---
 
@@ -137,11 +140,9 @@ pip install pyinstaller
 Copia `ffmpeg.exe` e `ffplay.exe` nella cartella ffmpeg_bin:
 
 ```text
-Windows/dist/AudioStreamMETER/
-├── AudioStreamMETER.exe
-├── ffmpeg.exe
-├── ffplay.exe
-└── _internal/
+/Windows/ffmpeg_bin/
+         ├── ffmpeg.exe
+         └── ffplay.exe
 ```
 
 > Puoi scaricare FFmpeg da [gyan.dev](https://ffmpeg.org/download.html) o [BtbN](https://github.com/BtbN/FFmpeg-Builds/releases)
