@@ -1,18 +1,18 @@
 # AudioStreamMETER
 
 Real-time stereo audio monitor for HTTP streams (MP3/AAC), designed for Radio and WebRadio broadcasting.
-Monitor up to 16 audio streams simultaneously with real-time waveform display + L/R spectrum analysis, LUFS and True Peak metering according to ITU-R BS.1770-4 algorithm and EBU R128-2023 standard. Features include: audio playback, configurable ffmpeg decoding settings, UI display options, selectable metering standards (EBU R128, YouTube, Spotify, AES71...) and preset management via CSV files for public AOIP streams with associated names.
+Monitor up to 16 audio streams simultaneously with real-time **waveform**, **L/R frequency spectrum**, **LUFS** and **Sample Peak** metering. Features include: audio playback (per-stream), configurable ffmpeg decoding settings, selectable metering standards (EBU R128, YouTube, Spotify, AES71...) and preset management via CSV files.
 
 ![Python](https://img.shields.io/badge/Python-3.10+-blue.svg)
 ![Platform](https://img.shields.io/badge/Platform-Windows-lightgrey.svg)
 ![Platform](https://img.shields.io/badge/Platform-Linux-lightgrey.svg)
-![License](https://img.shields.io/badge/License-GnuGPLv3-green.svg)
+![License](https://img.shields.io/badge/License-MIT-green.svg)
 
 ## Features
 
 - Simultaneous monitoring of up to 16 stereo audio streams
 - Real-time waveform visualization + L/R spectrum analysis
-- LUFS Short-term and True Peak Left/Right metering compliant with EBU R128
+- LUFS Short-term and **Sample Peak** L/R metering (sample-domain; not inter-sample oversampled True Peak)
 - Preset management, to automatically load sets of max. 16 stream IPs with associated names and emails for quick technical communications, with a simple .CSV file
 - Email preconfigurable message, modified as a
 - Modern interface with PyQt6
@@ -201,7 +201,8 @@ If you want to create your own custom installer:
 
 ## License
 
-This project is distributed under the GNU GPLv3 license. See the [LICENSE](LICENSE) file for details.
+This project is distributed under the **MIT License**. See the [LICENSE](LICENSE) file for details.
+Free to use, modify, and distribute — including in commercial/broadcast environments.
 
 ---
 

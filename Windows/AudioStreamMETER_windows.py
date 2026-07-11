@@ -360,7 +360,10 @@ def compute_lufs(samples_stereo: np.ndarray, sample_rate: int) -> float:
 
 
 def compute_true_peak_stereo(samples_stereo: np.ndarray) -> tuple[float, float]:
-    """True Peak in dBFS per canale L e R (ITU-R BS.1770-4)."""
+    """Sample Peak in dBFS for L and R channels (digital sample-domain max).
+    Note: This is sample-domain peak, NOT inter-sample True Peak (ITU-R BS.1770-4 TP).
+    True Peak requires 4× oversampling. Values here may under-read by up to ~3.5 dB.
+    """
     if samples_stereo.size == 0:
         return -70.0, -70.0
     left = samples_stereo[:, 0].astype(np.float64)
@@ -858,7 +861,7 @@ class OptionsDialog(QDialog):
         std_lbl = QLabel("Standard")
         std_lbl.setFixedWidth(200)
         std_lbl.setStyleSheet(f"color: {TEXT}; font-size: 14px; font-family: 'Courier New';")
-        std_lbl.setToolTip("Select the standard for LUFS and True Peak meter coloring")
+        std_lbl.setToolTip("Select the standard for LUFS and Sample Peak meter coloring")
         
         self._metering_combo = QComboBox()
         self._metering_combo.setMinimumHeight(28)
@@ -1005,7 +1008,7 @@ class OptionsDialog(QDialog):
             self._std_desc.setText(std.description)
             self._std_values.setText(
                 f"Target: {std.lufs_target:+.0f} LUFS (±{std.lufs_tolerance:.0f} dB)  |  "
-                f"True Peak max: {std.tp_max:+.0f} dBTP"
+                f"SPK max: {std.tp_max:+.0f} dBFS"
             )
         else:
             self._std_desc.setText("")
@@ -1083,8 +1086,8 @@ class StreamCard(QFrame):
         self._lufs_filled = 0  # frames validi nel buffer
         self._status = "connecting"
         self._lufs_value = -70.0
-        self._tp_l = -70.0              # True Peak canale sinistro
-        self._tp_r = -70.0              # True Peak canale destro
+        self._tp_l = -70.0              # Sample Peak left channel
+        self._tp_r = -70.0              # Sample Peak right channel
         self._worker = None
         self._qthread = None
         self._listening = False
@@ -1296,10 +1299,10 @@ class StreamCard(QFrame):
         self._lufs_label.setStyleSheet(
             f"color: {ACCENT}; font-size: 10px; font-family: 'Courier New'; font-weight: bold;")
 
-        self._tp_label = QLabel("TP L:— R:—")
+        self._tp_label = QLabel("SPK L:— R:—")
         self._tp_label.setStyleSheet(
             f"color: {TEXT_DIM}; font-size: 10px; font-family: 'Courier New'; font-weight: bold;")
-        self._tp_label.setToolTip("True Peak (dBFS) - L=Left R=Right")
+        self._tp_label.setToolTip("Sample Peak (dBFS) — L=Left R=Right\nNote: sample-domain peak, not inter-sample True Peak")
 
         self._lufs_bar = QProgressBar()
         self._lufs_bar.setRange(0, 100)
@@ -1553,16 +1556,16 @@ class StreamCard(QFrame):
             bar_val = int(max(0, min(100, (lufs + 60) / 54 * 100)))
             color = metering_std.get_lufs_color(lufs)
 
-        # True Peak stereo display
+        # Sample Peak stereo display
         tp_max = max(tp_l, tp_r)
         tp_color = metering_std.get_tp_color(tp_max)
         if tp_l <= -60 and tp_r <= -60:
-            tp_txt = "TP L:— R:—"
+            tp_txt = "SPK L:— R:—"
             tp_color = TEXT_DIM
         else:
             tp_l_s = f"{tp_l:+.0f}" if tp_l > -60 else "—"
             tp_r_s = f"{tp_r:+.0f}" if tp_r > -60 else "—"
-            tp_txt = f"TP L:{tp_l_s} R:{tp_r_s}"
+            tp_txt = f"SPK L:{tp_l_s} R:{tp_r_s}"
 
         self._lufs_label.setText(txt)
         self._tp_label.setText(tp_txt)
@@ -1711,7 +1714,7 @@ class MainWindow(QMainWindow):
         self._metering_std_label.setToolTip(
             f"Active Metering Standard: {std.name}\n"
             f"Target LUFS: {std.lufs_target:+.0f} (±{std.lufs_tolerance:.0f} dB)\n"
-            f"True Peak max: {std.tp_max:+.0f} dBTP\n\n"
+            f"Sample Peak max: {std.tp_max:+.0f} dBFS\n\n"
             "Change in ⚙ Options"
         )
         self._metering_std_label.setStyleSheet(f"color: {ACCENT}; font-size: 14px; font-family: 'Courier New';")
@@ -2259,7 +2262,7 @@ class MainWindow(QMainWindow):
         self._metering_std_label.setToolTip(
             f"Active Metering Standard: {metering_std.name}\n"
             f"Target LUFS: {metering_std.lufs_target:+.0f} (±{metering_std.lufs_tolerance:.0f} dB)\n"
-            f"True Peak max: {metering_std.tp_max:+.0f} dBTP\n\n"
+            f"Sample Peak max: {metering_std.tp_max:+.0f} dBFS\n"
             "Change in ⚙ Options"
         )
         
@@ -2273,7 +2276,7 @@ class MainWindow(QMainWindow):
             f"Smooth: {CONFIG.waveform_smooth}×\n\n"
             f"Standard Metering: {metering_std.name}\n"
             f"Target LUFS: {metering_std.lufs_target:+.0f}  |  "
-            f"TP max: {metering_std.tp_max:+.0f} dBTP\n\n"
+            f"SPK max: {metering_std.tp_max:+.0f} dBFS\n\n"
             f"New settings apply immediately."
         )
 

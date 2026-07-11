@@ -1,22 +1,30 @@
 """
-AudioStreamMETER
-Copyright (C) 2026 Andrea Mazzurana
+AudioStreamMETER v3.2
+MIT License
+Copyright (c) 2026 Andrea Mazzurana
 
-This program is free software: you can redistribute it and/or modify
-it under the terms of the GNU General Public License as published by
-the Free Software Foundation, either version 3 of the License, or
-(at your option) any later version.
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
 
-This program is distributed in the hope that it will be useful,
-but WITHOUT ANY WARRANTY; without even the implied warranty of
-MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
-GNU General Public License for more details.
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
 
-You should have received a copy of the GNU General Public License
-along with this program. If not, see <https://www.gnu.org/licenses/>.
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+
 ====================
 Monitor up to 16 stereo HTTP audio streams (MP3/AAC) in parallel.
-Displays real-time waveform and measures LUFS (short-term ~3s).
+Displays real-time waveform, LUFS short-term (~3s), Sample Peak, and
+frequency spectrum (20Hz-20kHz) per stream.
 
 Dependencies:
     pip install PyQt6 pyqtgraph numpy pyloudnorm
@@ -37,6 +45,10 @@ from typing import Dict
 
 import numpy as np
 import pyqtgraph as pg
+
+# Disable antialiasing globally for performance
+pg.setConfigOptions(antialias=False)
+
 from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QGridLayout, QVBoxLayout,
     QHBoxLayout, QPushButton, QLineEdit, QLabel, QFrame, QScrollArea, QInputDialog,
     QMessageBox, QProgressBar, QTextEdit, QComboBox, QFileDialog, QDialog, QSlider,
@@ -44,13 +56,13 @@ from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QGridLayout, QV
 from PyQt6.QtCore import Qt, QTimer, pyqtSignal, QObject, QThread, QAbstractNativeEventFilter
 from PyQt6.QtGui import QColor, QPalette, QFont
 
-# ── Rilevamento OS ──────────────────────────────────────────────────────────
+# ── OS Detection ────────────────────────────────────────────────────────────
 IS_WINDOWS = platform.system() == "Windows"
 
-# ── Windows Job Object (processo figlio visibile come albero nel Task Manager) ──
-# Tutti i processi ffmpeg/ffplay vengono assegnati a questo Job Object:
-#   - appaiono come figli di AudioStreamMETER.exe nella vista albero
-#   - vengono killati automaticamente dal kernel se l'app padre crasha
+# ── Windows Job Object ──────────────────────────────────────────────────────
+# All ffmpeg/ffplay processes are assigned to this Job Object:
+#   - appear as children of AudioStreamMETER.exe in the process tree
+#   - are killed automatically by the kernel if the parent app crashes
 _win_job = None
 
 if IS_WINDOWS:
@@ -59,7 +71,7 @@ if IS_WINDOWS:
 
         _KERNEL32 = ctypes.windll.kernel32
 
-        # Costanti Win32
+        # Win32 Constants
         _JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE = 0x00002000
         _JobObjectExtendedLimitInformation   = 9
 
@@ -104,12 +116,12 @@ if IS_WINDOWS:
             _win_job = _job_handle
 
     except Exception as _e:
-        print(f"[Job Object] Non disponibile: {_e}")
+        print(f"[Job Object] Not available: {_e}")
         _win_job = None
 
 
 def _assign_to_job(proc: "subprocess.Popen"):
-    """Assegna un processo figlio al Job Object dell'app (solo Windows)."""
+    """Assign a child process to the App's Job Object (Windows only)."""
     if not IS_WINDOWS or _win_job is None:
         return
     try:
@@ -122,50 +134,44 @@ def _assign_to_job(proc: "subprocess.Popen"):
 
 
 # ── Base Directory Detection ────────────────────────────────────────────────
-# When frozen (PyInstaller exe), use the exe's directory so that customization/
-# folder can be placed alongside the exe (not inside _internal).
-# This makes presets, metering_standards, and email_template accessible to users.
 if getattr(sys, 'frozen', False):
     _BASE_DIR = Path(sys.executable).parent
 else:
     _BASE_DIR = Path(__file__).parent
 
 
-# ── Costanti ────────────────────────────────────────────────────────────────
-# Riferimenti standard:
-#   - ITU-R BS.1770-4: LUFS metering (finestre 400ms momentary, 3s short-term)
-#   - EBU R128 / Tech 3341: Loudness metering per broadcast
-#   - EBU Tech 3276: Sample rate 48kHz per broadcast
-#   - ffmpeg documentation: probesize, analyzeduration
+# ── Constants ───────────────────────────────────────────────────────────────
+# References:
+#   - ITU-R BS.1770-4: LUFS metering
+#   - EBU R128 / Tech 3341: Loudness metering for broadcast
 
-# Costanti UI e metering
-WAVEFORM_HISTORY = 8192       # campioni nella waveform display
-LUFS_SHORTTERM_SEC = 3.0      # 3 secondi - Short-term loudness (ITU-R BS.1770-4)
+# UI and metering constants
+WAVEFORM_HISTORY = 8192       # samples in waveform display
+LUFS_SHORTTERM_SEC = 3.0      # 3 seconds - Short-term loudness
+SPECTRUM_UPDATE_INTERVAL = 0.10  # seconds between spectrum FFT updates (10 fps)
+LUFS_UPDATE_INTERVAL     = 0.50  # seconds between LUFS/TP computations (2 per sec)
 
-# ── Configurazione Corrente ──────────────────────────────────────────────────
+# ── Current Configuration ───────────────────────────────────────────────────
 class StreamConfig:
-    """
-    Configurazione globale con valori liberi impostabili dall'utente.
-    Tutti i parametri sono modificabili direttamente dal dialog Opzioni.
-    """
+    """Global configuration — all parameters editable from the Options dialog."""
     def __init__(self):
-        # ── Parametri ffmpeg ──
+        # ── ffmpeg parameters ──
         self.sample_rate      = 48000    # Hz: 22050 / 44100 / 48000
-        self.chunk_samples    = 480      # campioni per chunk (10ms @ 48kHz)
-        self.probesize        = 50000    # byte: 16384–200000
+        self.chunk_samples    = 480      # samples per chunk (10ms @ 48kHz)
+        self.probesize        = 50000    # bytes: 16384–200000
         self.analyzeduration  = 1000000  # µs: 500000–3000000
 
-        # ── Parametri display ──
-        self.refresh_ms       = 50       # ms tra refresh UI (20 FPS)
-        self.waveform_smooth  = 4        # decimazione waveform: 1=massimo dettaglio, 16=molto smooth
+        # ── display parameters ──
+        self.refresh_ms       = 50       # ms between UI refreshes (20 FPS)
+        self.waveform_smooth  = 4        # waveform decimation: 1=max detail, 16=very smooth
 
-        # ── Email template ──
+        # ── email template ──
         self.email_subject    = "[AudioStreamMETER] Issue with stream: {stream_name}"
         self.email_body       = "Stream URL: {stream_url}\nStream Name: {stream_name}\n\nIssue description:\n"
 
     @property
     def chunk_bytes(self) -> int:
-        return self.chunk_samples * 4    # stereo s16le (2 canali × 2 byte)
+        return self.chunk_samples * 4    # stereo s16le (2 channels × 2 bytes)
 
     @property
     def pipe_buffer_size(self) -> int:
@@ -180,15 +186,15 @@ class StreamConfig:
         return 1000 / self.refresh_ms
 
 
-# Istanza globale
+# Global config instance
 CONFIG = StreamConfig()
 
 
-# ── Cartella Customization (raccoglie preset, standard, template) ───────────
+# ── Customization directory (presets, standards, email template) ────────────
 _CUSTOMIZATION_DIR = _BASE_DIR / "customization"
 
 
-# ── Persistenza Email Template ─────────────────────────────────────────
+# ── Email template persistence ───────────────────────────────────────────────
 _EMAIL_TEMPLATE_FILE = _CUSTOMIZATION_DIR / "email_template.json"
 
 def _load_email_template():
@@ -217,7 +223,7 @@ def _save_email_template():
     except Exception as e:
         print(f"[Email Template] Could not save: {e}")
 
-# Carica template salvato all'avvio
+# Load saved email template at startup
 _load_email_template()
 
 
@@ -261,9 +267,20 @@ class MeteringStandard:
 
 
 
-# ── Caricamento Standard di Metering da JSON ────────────────────────────────
-_METERING_STANDARDS_DIR = _CUSTOMIZATION_DIR / "metering_standards"
-_METERING_STANDARDS_FILE = _METERING_STANDARDS_DIR / "standards.json"
+# ── Metering standards — smart path resolution ──────────────────────────────
+# When running from source, standards.json lives at src/metering_standards/.
+# When installed (Windows bundle), it lives at customization/metering_standards/.
+def _resolve_metering_standards_file() -> Path:
+    """Return the standards.json path, preferring the customization/ overlay."""
+    installed = _CUSTOMIZATION_DIR / "metering_standards" / "standards.json"
+    if installed.exists():
+        return installed
+    bundled = _BASE_DIR / "metering_standards" / "standards.json"
+    if bundled.exists():
+        return bundled
+    return installed  # Return preferred path; loader will report the error
+
+_METERING_STANDARDS_FILE = _resolve_metering_standards_file()
 
 def _load_metering_standards() -> Dict[str, MeteringStandard]:
     """Load metering standards from JSON file."""
@@ -293,15 +310,15 @@ def _load_metering_standards() -> Dict[str, MeteringStandard]:
 
 METERING_STANDARDS: Dict[str, MeteringStandard] = _load_metering_standards()
 
-# Standard di metering attivo (default: AES71)
+# Active metering standard (default: EBU R128)
 CURRENT_METERING_STANDARD: str = "EBU R128"
 
 def get_current_metering_standard() -> MeteringStandard:
-    """Ritorna lo standard di metering attualmente selezionato."""
-    return METERING_STANDARDS.get(CURRENT_METERING_STANDARD, METERING_STANDARDS["EBU R128"])
+    """Return the currently active metering standard."""
+    return METERING_STANDARDS.get(CURRENT_METERING_STANDARD, next(iter(METERING_STANDARDS.values())))
 
 def set_metering_standard(name: str) -> bool:
-    """Imposta lo standard di metering. Ritorna True se valido."""
+    """Set the active metering standard. Returns True if valid."""
     global CURRENT_METERING_STANDARD
     if name in METERING_STANDARDS:
         CURRENT_METERING_STANDARD = name
@@ -343,38 +360,41 @@ def _get_lufs_meter(sample_rate: int):
     return _LUFS_METER_CACHE[sample_rate]
 
 def compute_lufs(samples_stereo: np.ndarray, sample_rate: int) -> float:
-    """LUFS short-term via pyloudnorm (stereo, ITU-R BS.1770-4)."""
+    """Short-term LUFS via pyloudnorm (stereo, ITU-R BS.1770-4)."""
     if samples_stereo.size == 0:
         return -70.0
     meter = _get_lufs_meter(sample_rate)
     if meter is not None:
-        # pyloudnorm accetta shape (N, 2) per stereo, valori float64 [-1, 1]
-        data = samples_stereo.astype(np.float64) / 32768.0
-        if data.ndim == 1:  # fallback mono
+        # pyloudnorm expects shape (N, 2), float in [-1.0, 1.0]
+        # float32 is sufficient precision for loudness metering
+        data = samples_stereo.astype(np.float32) * np.float32(1.0 / 32768.0)
+        if data.ndim == 1:  # mono fallback
             data = data.reshape(-1, 1)
         lufs = meter.integrated_loudness(data)
         return lufs if math.isfinite(lufs) else -70.0
-    # Fallback RMS stereo
-    rms = np.sqrt(np.mean(samples_stereo.astype(np.float64) ** 2))
-    return 20 * math.log10(rms / 32768.0) - 0.691 if rms >= 1.0 else -70.0
+    # Fallback: simple RMS-based approximation (no pyloudnorm)
+    rms = math.sqrt(float(np.mean(samples_stereo.astype(np.float32) ** 2)))
+    return 20.0 * math.log10(rms / 32768.0) - 0.691 if rms >= 1.0 else -70.0
 
 
 def compute_true_peak_stereo(samples_stereo: np.ndarray) -> tuple[float, float]:
-    """True Peak in dBFS per canale L e R (ITU-R BS.1770-4)."""
+    """Sample Peak in dBFS for L and R channels (digital sample-domain max).
+    Note: This is sample-domain peak, NOT inter-sample True Peak (ITU-R BS.1770-4 TP).
+    True Peak requires 4× oversampling. Values here may under-read by up to ~3.5 dB.
+    """
     if samples_stereo.size == 0:
         return -70.0, -70.0
-    left = samples_stereo[:, 0].astype(np.float64)
-    right = samples_stereo[:, 1].astype(np.float64)
-    peak_l = np.max(np.abs(left))
-    peak_r = np.max(np.abs(right))
-    tp_l = 20 * math.log10(peak_l / 32768.0) if peak_l >= 1.0 else -70.0
-    tp_r = 20 * math.log10(peak_r / 32768.0) if peak_r >= 1.0 else -70.0
+    # Work directly on int16 — abs(int16) stays in int16, no float conversion needed
+    peak_l = int(np.max(np.abs(samples_stereo[:, 0])))
+    peak_r = int(np.max(np.abs(samples_stereo[:, 1])))
+    tp_l = 20.0 * math.log10(peak_l / 32768.0) if peak_l >= 1 else -70.0
+    tp_r = 20.0 * math.log10(peak_r / 32768.0) if peak_r >= 1 else -70.0
     return tp_l, tp_r
 
 
-# ── Worker decodifica stream ─────────────────────────────────────────────────
+# ── Stream decode worker ────────────────────────────────────────────────────
 class StreamWorker(QObject):
-    data_ready = pyqtSignal(np.ndarray, float)
+    data_ready = pyqtSignal(np.ndarray)
     error_signal = pyqtSignal(str)
     status_signal = pyqtSignal(str)
 
@@ -421,13 +441,12 @@ class StreamWorker(QObject):
             self._safe_emit(self.status_signal, "live")
             while not self._stop_event.is_set():
                 raw = proc.stdout.read(CONFIG.chunk_bytes)
-                emit_time = time.time()
                 if not raw or not self._alive: break
-                self._safe_emit(self.data_ready, np.frombuffer(raw, dtype=np.int16).copy(), emit_time)
+                self._safe_emit(self.data_ready, np.frombuffer(raw, dtype=np.int16).copy())
         except FileNotFoundError:
-            self._safe_emit(self.error_signal, "ffmpeg non trovato nel PATH")
+            self._safe_emit(self.error_signal, "ffmpeg not found in PATH")
         except Exception as e:
-            if self._alive:  # ignora errori dovuti al kill volontario
+            if self._alive:  # ignore errors caused by intentional kill
                 self._safe_emit(self.error_signal, str(e))
         finally:
             self._proc = None
@@ -858,7 +877,7 @@ class OptionsDialog(QDialog):
         std_lbl = QLabel("Standard")
         std_lbl.setFixedWidth(200)
         std_lbl.setStyleSheet(f"color: {TEXT}; font-size: 14px; font-family: 'Courier New';")
-        std_lbl.setToolTip("Select the standard for LUFS and True Peak meter coloring")
+        std_lbl.setToolTip("Select the standard for LUFS and Sample Peak meter coloring")
         
         self._metering_combo = QComboBox()
         self._metering_combo.setMinimumHeight(28)
@@ -1005,7 +1024,7 @@ class OptionsDialog(QDialog):
             self._std_desc.setText(std.description)
             self._std_values.setText(
                 f"Target: {std.lufs_target:+.0f} LUFS (±{std.lufs_tolerance:.0f} dB)  |  "
-                f"True Peak max: {std.tp_max:+.0f} dBTP"
+                f"SPK max: {std.tp_max:+.0f} dBFS"
             )
         else:
             self._std_desc.setText("")
@@ -1053,14 +1072,18 @@ class StreamCard(QFrame):
     
     @classmethod
     def _get_fft_cache(cls, sample_rate: int, fft_size: int = 2048, n_display: int = 256):
-        """Returns cached FFT constants for given sample rate."""
+        """Returns cached FFT constants for given sample rate.
+        Window is stored as float32 to match the FFT input and avoid
+        implicit upcasting to float64 in the hot path.
+        """
         key = (sample_rate, fft_size, n_display)
         if key not in cls._fft_cache:
-            window = np.hanning(fft_size)
+            # float32: faster FFT path, sufficient precision for spectrum display
+            window = np.hanning(fft_size).astype(np.float32)
             log_freqs = np.logspace(np.log10(20), np.log10(20000), n_display)
             freq_per_bin = sample_rate / fft_size
             bin_indices = np.clip((log_freqs / freq_per_bin).astype(int), 0, fft_size // 2)
-            x_axis = np.log10(log_freqs)
+            x_axis = np.log10(log_freqs).astype(np.float32)
             cls._fft_cache[key] = (window, log_freqs, bin_indices, x_axis)
         return cls._fft_cache[key]
 
@@ -1071,29 +1094,37 @@ class StreamCard(QFrame):
         self._custom_name = ""          # nome impostato dall'utente
         self._email = email             # email di contatto per supporto
         
-        # ── Buffer waveform stereo (numpy arrays for performance) ────────────
+        # ── Waveform ring buffers (float32, written by data thread) ─────────
         self._waveform_arr_l = np.zeros(WAVEFORM_HISTORY, dtype=np.float32)
         self._waveform_arr_r = np.zeros(WAVEFORM_HISTORY, dtype=np.float32)
         self._waveform_write_idx = 0
+        # Pre-allocated display buffers: unrolled ring with zero-alloc copy
+        self._display_l = np.empty(WAVEFORM_HISTORY, dtype=np.float32)
+        self._display_r = np.empty(WAVEFORM_HISTORY, dtype=np.float32)
+        # Pre-allocated FFT input buffer — avoids np.vstack alloc on wrap-around
+        self._fft_buf = np.empty((2048, 2), dtype=np.int16)
         
-        # Ring buffer numpy per LUFS stereo (evita conversioni deque → list → numpy)
-        self._lufs_buf_size = int(CONFIG.sample_rate * LUFS_SHORTTERM_SEC)  # frames stereo
+        # LUFS ring buffer: stereo int16, 3 seconds of audio
+        self._lufs_buf_size = int(CONFIG.sample_rate * LUFS_SHORTTERM_SEC)  # stereo frames
         self._lufs_buf = np.zeros((self._lufs_buf_size, 2), dtype=np.int16)  # shape (N, 2)
         self._lufs_write_idx = 0
-        self._lufs_filled = 0  # frames validi nel buffer
+        self._lufs_filled = 0  # valid frames in buffer
         self._status = "connecting"
         self._lufs_value = -70.0
-        self._tp_l = -70.0              # True Peak canale sinistro
-        self._tp_r = -70.0              # True Peak canale destro
+        self._tp_l = -70.0              # Sample Peak left channel
+        self._tp_r = -70.0              # Sample Peak right channel
         self._worker = None
         self._qthread = None
         self._listening = False
         
-        # ── Performance: throttle counters & color cache ─────────────────────
-        self._frame_counter = 0         # counts refresh_display calls
-        self._last_lufs_update = 0.0    # timestamp of last LUFS computation
-        self._last_lufs_color = None    # cached color to avoid setStyleSheet
-        self._last_tp_color = None      # cached TP color
+        # ── Performance: time-based throttle timestamps & color cache ─────────
+        self._last_lufs_update     = 0.0   # timestamp of last LUFS computation
+        self._last_spectrum_update = 0.0   # timestamp of last spectrum FFT
+        self._last_lufs_color  = None      # cached LUFS color (avoid setStyleSheet)
+        self._last_tp_color    = None      # cached TP color
+        self._last_lufs_display = -999.0   # last displayed LUFS value (for text throttle)
+        self._last_tp_l_display = -999.0   # last displayed TP left
+        self._last_tp_r_display = -999.0   # last displayed TP right
 
         self._build_ui()
         self._start_stream()
@@ -1226,8 +1257,7 @@ class StreamCard(QFrame):
         header.addWidget(remove_btn)
         root.addLayout(header)
 
-        # ── Waveform Stereo: L sopra (cyan), R sotto (magenta) ──────────
-        pg.setConfigOptions(antialias=False)
+        # ── Waveform Stereo: L top (cyan), R bottom (magenta) ──────────
         self._plot = pg.PlotWidget(background=BG_CARD2)
         self._plot.setMinimumHeight(36)  # Compact mode for 4x4 grid
         self._plot.hideAxis("left")
@@ -1235,16 +1265,18 @@ class StreamCard(QFrame):
         self._plot.setMouseEnabled(x=False, y=False)
         self._plot.setYRange(-32768, 32768, padding=0)
         self._plot.getPlotItem().setContentsMargins(0, 0, 0, 0)
+        # Disable right-click context menu (removes irrelevant pyqtgraph options)
+        self._plot.getPlotItem().getViewBox().setMenuEnabled(False)
         # Set tick font on hidden axes to prevent QFont warning
         self._plot.getPlotItem().getAxis('left').setStyle(tickFont=QFont("Courier New", 9))
         self._plot.getPlotItem().getAxis('bottom').setStyle(tickFont=QFont("Courier New", 9))
         
-        # Linea separatrice centrale L/R
+        # Center separator line L/R
         center_line = pg.InfiniteLine(pos=0, angle=0, pen=pg.mkPen(color=GRAY, width=1, style=Qt.PenStyle.DotLine))
         self._plot.addItem(center_line)
 
-        pen_l = pg.mkPen(color=ACCENT, width=1)     # L = cyan (sopra)
-        pen_r = pg.mkPen(color="#ff40ff", width=1)  # R = magenta (sotto)
+        pen_l = pg.mkPen(color=ACCENT, width=1)     # L = cyan (top)
+        pen_r = pg.mkPen(color="#ff40ff", width=1)  # R = magenta (bottom)
         self._curve_l = self._plot.plot([], [], pen=pen_l)
         self._curve_r = self._plot.plot([], [], pen=pen_r)
         root.addWidget(self._plot, 1)
@@ -1258,6 +1290,8 @@ class StreamCard(QFrame):
         # Logarithmic X axis: 20Hz to 20kHz
         self._spectrum_plot.setXRange(np.log10(20), np.log10(20000), padding=0)
         self._spectrum_plot.getPlotItem().setContentsMargins(0, 0, 0, 0)
+        # Disable right-click context menu (removes irrelevant pyqtgraph options)
+        self._spectrum_plot.getPlotItem().getViewBox().setMenuEnabled(False)
         
         # Configure left axis with dB labels
         left_axis = self._spectrum_plot.getPlotItem().getAxis('left')
@@ -1274,14 +1308,14 @@ class StreamCard(QFrame):
         bottom_axis.setPen(pg.mkPen(color=GRAY, width=1))
         bottom_axis.setTextPen(pg.mkPen(color=TEXT_DIM))
         # Custom ticks at 20Hz, 100Hz, 1kHz, 10kHz, 20kHz
-        freq_ticks = [(np.log10(20), "20"), (np.log10(100), "100"), 
+        freq_ticks = [(np.log10(20), "20"), (np.log10(100), "100"),
                       (np.log10(1000), "1k"), (np.log10(10000), "10k"), (np.log10(20000), "20k")]
         bottom_axis.setTicks([freq_ticks])
         
         # Add grid
         self._spectrum_plot.showGrid(x=True, y=False, alpha=0.3)
         
-        # Spectrum curves (stessi colori della waveform)
+        # Spectrum curves (same colours as waveform)
         pen_spec_l = pg.mkPen(color=ACCENT, width=1.5)
         pen_spec_r = pg.mkPen(color="#ff40ff", width=1.5)
         self._spectrum_curve_l = self._spectrum_plot.plot([], [], pen=pen_spec_l)
@@ -1296,10 +1330,10 @@ class StreamCard(QFrame):
         self._lufs_label.setStyleSheet(
             f"color: {ACCENT}; font-size: 10px; font-family: 'Courier New'; font-weight: bold;")
 
-        self._tp_label = QLabel("TP L:— R:—")
+        self._tp_label = QLabel("SPK L:— R:—")
         self._tp_label.setStyleSheet(
             f"color: {TEXT_DIM}; font-size: 10px; font-family: 'Courier New'; font-weight: bold;")
-        self._tp_label.setToolTip("True Peak (dBFS) - L=Left R=Right")
+        self._tp_label.setToolTip("Sample Peak (dBFS) — L=Left R=Right\nNote: sample-domain peak, not inter-sample True Peak")
 
         self._lufs_bar = QProgressBar()
         self._lufs_bar.setRange(0, 100)
@@ -1409,6 +1443,9 @@ class StreamCard(QFrame):
         self._worker.error_signal.connect(self._on_error)
         self._worker.status_signal.connect(self._on_status)
         self._qthread.started.connect(self._worker.start)
+        # Ensure Qt properly frees thread and worker objects on exit
+        self._qthread.finished.connect(self._qthread.deleteLater)
+        self._qthread.finished.connect(self._worker.deleteLater)
         self._qthread.start()
 
     def stop_stream(self):
@@ -1424,24 +1461,25 @@ class StreamCard(QFrame):
         if self._qthread:
             self._qthread.quit()
             if not self._qthread.wait(3000):
-                # QThread non terminato: termina forzatamente
+                # Thread still running: force terminate
                 self._qthread.terminate()
                 self._qthread.wait(1000)
 
     # ── Slots ─────────────────────────────────────────────────────────────────
-    def _on_data(self, samples: np.ndarray, emit_time: float):
+    def _on_data(self, samples: np.ndarray):
         # Reshape interleaved stereo (L,R,L,R...) → (N, 2)
         stereo = samples.reshape(-1, 2)
         n_frames = stereo.shape[0]
         
-        # ── Waveform stereo: L sopra (0→32768), R sotto (-32768→0) ───
-        smooth = max(1, CONFIG.waveform_smooth)
-        step = max(1, n_frames // (256 // smooth))
-        # Scala e offset: L metà superiore, R metà inferiore
+        # ── Waveform: L top (0→+32768 scaled), R bottom (−32768→0 scaled) ──
+        # Simplified decimation: multiply smooth before dividing avoids edge cases
+        smooth = CONFIG.waveform_smooth
+        step = max(1, n_frames * smooth // 256)
+        # Scale and offset: L upper half, R lower half
         left_scaled = stereo[::step, 0].astype(np.float32) * 0.5 + 16384
         right_scaled = stereo[::step, 1].astype(np.float32) * 0.5 - 16384
         
-        # ── Ring buffer waveform (numpy, no deque) ───────────────────────
+        # ── Waveform ring buffer (numpy, no deque) ───────────────────────
         n_new = len(left_scaled)
         buf_size = WAVEFORM_HISTORY
         if n_new >= buf_size:
@@ -1487,65 +1525,69 @@ class StreamCard(QFrame):
         self._name_edit.setText(f"⚠ {msg}")
         self._name_edit.setStyleSheet(f"color: {RED}; font-size: 13px; font-family: 'Courier New'; background: transparent; border: none;")
 
-    def refresh_display(self):
-        self._frame_counter += 1
-        current_time = time.time()
+    def refresh_display(self, current_time: float, metering_std: "MeteringStandard"):
+        """Called by _refresh_all() every frame with pre-computed time and standard."""
         
-        # ── Aggiorna waveform stereo (numpy array, no list conversion) ───────
-        # Riordina il ring buffer per visualizzazione continua
+        # ── Waveform stereo: zero-alloc ring-buffer unroll ───────────────────
+        # Instead of np.roll() (which allocates a new array every call),
+        # we copy the two halves into pre-allocated display buffers.
         idx = self._waveform_write_idx
-        waveform_l = np.roll(self._waveform_arr_l, -idx)
-        waveform_r = np.roll(self._waveform_arr_r, -idx)
-        self._curve_l.setData(waveform_l)
-        self._curve_r.setData(waveform_r)
+        tail = WAVEFORM_HISTORY - idx
+        self._display_l[:tail] = self._waveform_arr_l[idx:]
+        self._display_l[tail:] = self._waveform_arr_l[:idx]
+        self._display_r[:tail] = self._waveform_arr_r[idx:]
+        self._display_r[tail:] = self._waveform_arr_r[:idx]
+        self._curve_l.setData(self._display_l)
+        self._curve_r.setData(self._display_r)
 
-        # ── Spectrum FFT (throttled: every 3 frames) ─────────────────────────
-        if self._frame_counter % 3 == 0 and self._lufs_filled >= 2048:
+        # ── Spectrum FFT (time-based throttle: ~10 fps) ──────────────────────
+        if (current_time - self._last_spectrum_update >= SPECTRUM_UPDATE_INTERVAL
+                and self._lufs_filled >= 2048):
+            self._last_spectrum_update = current_time
             fft_size = 2048
-            # Calcola indice di partenza nel ring buffer
+            # Locate the most recent fft_size frames in the ring buffer
             start_idx = (self._lufs_write_idx - fft_size) % self._lufs_buf_size
             if start_idx + fft_size <= self._lufs_buf_size:
                 fft_data = self._lufs_buf[start_idx:start_idx + fft_size]
             else:
-                # Wrap around
-                first_part = self._lufs_buf[start_idx:]
-                second_part = self._lufs_buf[:fft_size - len(first_part)]
-                fft_data = np.vstack([first_part, second_part])
+                # Wrap-around: copy into pre-allocated buffer (no np.vstack alloc)
+                n1 = self._lufs_buf_size - start_idx
+                self._fft_buf[:n1] = self._lufs_buf[start_idx:]
+                self._fft_buf[n1:]  = self._lufs_buf[:fft_size - n1]
+                fft_data = self._fft_buf
             
-            # Get cached FFT constants (window, log_freqs, bin_indices, x_axis)
+            # Cached window (float32) + log-scale bin indices
             window, _, bin_indices, x_axis = self._get_fft_cache(CONFIG.sample_rate, fft_size)
             
-            left_ch = fft_data[:, 0].astype(np.float64) / 32768.0
-            right_ch = fft_data[:, 1].astype(np.float64) / 32768.0
+            # float32 path: 2x faster than float64, more than sufficient for display
+            left_ch  = fft_data[:, 0].astype(np.float32) * (1.0 / 32768.0)
+            right_ch = fft_data[:, 1].astype(np.float32) * (1.0 / 32768.0)
             
-            fft_l = np.abs(np.fft.rfft(left_ch * window))
+            fft_l = np.abs(np.fft.rfft(left_ch  * window))
             fft_r = np.abs(np.fft.rfft(right_ch * window))
             
-            # Converti in dB (con floor a -80 dB)
-            eps = 1e-10
-            db_l = np.clip(20 * np.log10(fft_l / fft_size + eps), -80, 0)
-            db_r = np.clip(20 * np.log10(fft_r / fft_size + eps), -80, 0)
+            # Convert to dB with -80 dB floor
+            eps = np.float32(1e-10)
+            db_l = np.clip(20.0 * np.log10(fft_l / fft_size + eps), -80, 0)
+            db_r = np.clip(20.0 * np.log10(fft_r / fft_size + eps), -80, 0)
             
-            # Sample FFT at cached bin indices
+            # Sample at cached log-scale bin indices
             self._spectrum_curve_l.setData(x_axis, db_l[bin_indices])
             self._spectrum_curve_r.setData(x_axis, db_r[bin_indices])
 
-        # ── LUFS/TP (throttled: every 500ms = ~10 updates/sec) ───────────────
-        if current_time - self._last_lufs_update >= 0.5 and self._lufs_filled >= CONFIG.sample_rate // 2:
+        # ── LUFS/TP computation (time-based throttle: every 500ms) ──────────
+        if (current_time - self._last_lufs_update >= LUFS_UPDATE_INTERVAL
+                and self._lufs_filled >= CONFIG.sample_rate // 2):
             self._last_lufs_update = current_time
-            if self._lufs_filled == self._lufs_buf_size:
-                arr = self._lufs_buf
-            else:
-                arr = self._lufs_buf[:self._lufs_filled]
+            arr = self._lufs_buf if self._lufs_filled == self._lufs_buf_size \
+                  else self._lufs_buf[:self._lufs_filled]
             self._lufs_value = compute_lufs(arr, CONFIG.sample_rate)
             self._tp_l, self._tp_r = compute_true_peak_stereo(arr)
 
         lufs = self._lufs_value
         tp_l, tp_r = self._tp_l, self._tp_r
         
-        metering_std = get_current_metering_standard()
-        
-        # LUFS display
+        # LUFS display values
         if lufs <= -60:
             txt, bar_val, color = "LUFS —.—", 0, TEXT_DIM
         else:
@@ -1553,22 +1595,33 @@ class StreamCard(QFrame):
             bar_val = int(max(0, min(100, (lufs + 60) / 54 * 100)))
             color = metering_std.get_lufs_color(lufs)
 
-        # True Peak stereo display
+        # Sample Peak stereo display
         tp_max = max(tp_l, tp_r)
         tp_color = metering_std.get_tp_color(tp_max)
         if tp_l <= -60 and tp_r <= -60:
-            tp_txt = "TP L:— R:—"
+            tp_txt = "SPK L:— R:—"
             tp_color = TEXT_DIM
         else:
             tp_l_s = f"{tp_l:+.0f}" if tp_l > -60 else "—"
             tp_r_s = f"{tp_r:+.0f}" if tp_r > -60 else "—"
-            tp_txt = f"TP L:{tp_l_s} R:{tp_r_s}"
+            tp_txt = f"SPK L:{tp_l_s} R:{tp_r_s}"
 
-        self._lufs_label.setText(txt)
-        self._tp_label.setText(tp_txt)
-        self._lufs_bar.setValue(bar_val)
+        # ── Throttle text/bar updates: only write when value changes meaningfully
+        # This avoids calling Qt text-setting machinery on every single frame.
+        lufs_changed = abs(lufs - self._last_lufs_display) >= 0.2
+        tp_changed   = (abs(tp_l - self._last_tp_l_display) >= 0.5 or
+                        abs(tp_r - self._last_tp_r_display) >= 0.5)
+
+        if lufs_changed:
+            self._last_lufs_display = lufs
+            self._lufs_label.setText(txt)
+            self._lufs_bar.setValue(bar_val)
+        if tp_changed:
+            self._last_tp_l_display = tp_l
+            self._last_tp_r_display = tp_r
+            self._tp_label.setText(tp_txt)
         
-        # ── Update stylesheet only when color changes ────────────────────────
+        # ── Update stylesheet only when color changes (avoid repeated setStyleSheet) ──
         if color != self._last_lufs_color:
             self._last_lufs_color = color
             self._lufs_label.setStyleSheet(
@@ -1623,7 +1676,8 @@ class MainWindow(QMainWindow):
 
         self._timer = QTimer()
         self._timer.timeout.connect(self._refresh_all)
-        self._timer.start(66)
+        # Use CONFIG.refresh_ms (default 50ms = 20fps) — was hardcoded to 66ms
+        self._timer.start(CONFIG.refresh_ms)
 
         # ── Registrazione notifiche sessione Windows ──────────────────────
         # Rileva sblocco schermo/stand-by per forzare refresh waveform
@@ -1698,7 +1752,7 @@ class MainWindow(QMainWindow):
         left_col = QVBoxLayout()
         left_col.setSpacing(1)
 
-        title = QLabel("AudioStreamMETER v3.1")
+        title = QLabel("AudioStreamMETER v3.2")
         title.setStyleSheet(f"color: {ACCENT}; font-size: 16px; font-family: 'Courier New'; font-weight: bold; letter-spacing: 2px;")
 
         # Author attribution
@@ -1711,7 +1765,7 @@ class MainWindow(QMainWindow):
         self._metering_std_label.setToolTip(
             f"Active Metering Standard: {std.name}\n"
             f"Target LUFS: {std.lufs_target:+.0f} (±{std.lufs_tolerance:.0f} dB)\n"
-            f"True Peak max: {std.tp_max:+.0f} dBTP\n\n"
+            f"Sample Peak max: {std.tp_max:+.0f} dBFS\n\n"
             "Change in ⚙ Options"
         )
         self._metering_std_label.setStyleSheet(f"color: {ACCENT}; font-size: 14px; font-family: 'Courier New';")
@@ -2240,8 +2294,11 @@ class MainWindow(QMainWindow):
         self._add_btn.setEnabled(n < self.MAX_STREAMS)
 
     def _refresh_all(self):
+        # Compute time and metering standard ONCE per frame, shared across all cards
+        now = time.time()
+        std = get_current_metering_standard()
         for card in self._cards:
-            card.refresh_display()
+            card.refresh_display(now, std)
 
     def _show_options(self):
         """Mostra il dialog delle opzioni."""
@@ -2259,7 +2316,7 @@ class MainWindow(QMainWindow):
         self._metering_std_label.setToolTip(
             f"Active Metering Standard: {metering_std.name}\n"
             f"Target LUFS: {metering_std.lufs_target:+.0f} (±{metering_std.lufs_tolerance:.0f} dB)\n"
-            f"True Peak max: {metering_std.tp_max:+.0f} dBTP\n\n"
+            f"Sample Peak max: {metering_std.tp_max:+.0f} dBFS\n"
             "Change in ⚙ Options"
         )
         
@@ -2273,7 +2330,7 @@ class MainWindow(QMainWindow):
             f"Smooth: {CONFIG.waveform_smooth}×\n\n"
             f"Standard Metering: {metering_std.name}\n"
             f"Target LUFS: {metering_std.lufs_target:+.0f}  |  "
-            f"TP max: {metering_std.tp_max:+.0f} dBTP\n\n"
+            f"SPK max: {metering_std.tp_max:+.0f} dBFS\n\n"
             f"New settings apply immediately."
         )
 

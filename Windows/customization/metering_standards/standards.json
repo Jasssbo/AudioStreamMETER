@@ -5,7 +5,7 @@
     "lufs_warning": 3.0,
     "tp_max": -1.0,
     "tp_warning": -4.0,
-    "description": "European broadcast standard (TV, radio). Target -23 LUFS ±2 dB, TP max -1 dBTP"
+    "description": "European broadcast standard (TV, radio). Target -23 LUFS ±2 dB, SPK max -1 dBFS"
   },
   "EBU R128 S1 (Streaming)": {
     "lufs_target": -16.0,
@@ -13,7 +13,7 @@
     "lufs_warning": 3.0,
     "tp_max": -1.0,
     "tp_warning": -4.0,
-    "description": "EBU R128 for streaming (Spotify, Tidal). Target -16 LUFS, TP max -1 dBTP"
+    "description": "EBU R128 for streaming (Spotify, Tidal). Target -16 LUFS, SPK max -1 dBFS"
   },
   "EBU R128 S2 (Podcast)": {
     "lufs_target": -18.0,
@@ -21,7 +21,7 @@
     "lufs_warning": 3.0,
     "tp_max": -1.0,
     "tp_warning": -4.0,
-    "description": "EBU R128 S2 for podcast/audiobook. Target -18 LUFS, TP max -1 dBTP"
+    "description": "EBU R128 S2 for podcast/audiobook. Target -18 LUFS, SPK max -1 dBFS"
   },
   "Podcast (Generic)": {
     "lufs_target": -18.0,
@@ -29,7 +29,7 @@
     "lufs_warning": 3.0,
     "tp_max": -1.0,
     "tp_warning": -3.0,
-    "description": "Generic podcast target. -16 to -20 LUFS, TP max -1 dBTP"
+    "description": "Generic podcast target. -16 to -20 LUFS, SPK max -1 dBFS"
   },
   "AES71 (Portable Devices)": {
     "lufs_target": -16.0,
@@ -37,7 +37,7 @@
     "lufs_warning": 3.0,
     "tp_max": -1.0,
     "tp_warning": -4.0,
-    "description": "AES71-2018 for portable devices. Target -16 LUFS, TP max -1 dBTP"
+    "description": "AES71-2018 for portable devices. Target -16 LUFS, SPK max -1 dBFS"
   },
   "YouTube": {
     "lufs_target": -14.0,
@@ -45,7 +45,7 @@
     "lufs_warning": 3.0,
     "tp_max": -1.0,
     "tp_warning": -4.0,
-    "description": "YouTube normalizes to -14 LUFS. TP max -1 dBTP recommended"
+    "description": "YouTube normalizes to -14 LUFS. SPK max -1 dBFS recommended"
   },
   "Spotify": {
     "lufs_target": -14.0,
@@ -53,7 +53,7 @@
     "lufs_warning": 3.0,
     "tp_max": -1.0,
     "tp_warning": -3.0,
-    "description": "Spotify Loud normalizes to -14 LUFS. TP max -1 dBTP"
+    "description": "Spotify Loud normalizes to -14 LUFS. SPK max -1 dBFS"
   },
   "Apple Music / iTunes": {
     "lufs_target": -16.0,
@@ -61,7 +61,7 @@
     "lufs_warning": 3.0,
     "tp_max": -1.0,
     "tp_warning": -2.0,
-    "description": "Apple Sound Check normalizes to -16 LUFS. TP max -1 dBTP"
+    "description": "Apple Sound Check normalizes to -16 LUFS. SPK max -1 dBFS"
   },
   "Amazon Music": {
     "lufs_target": -14.0,
@@ -69,7 +69,7 @@
     "lufs_warning": 3.0,
     "tp_max": -2.0,
     "tp_warning": -3.0,
-    "description": "Amazon Music normalizes to -14 LUFS. TP max -2 dBTP recommended"
+    "description": "Amazon Music normalizes to -14 LUFS. SPK max -2 dBFS recommended"
   },
   "Netflix": {
     "lufs_target": -27.0,
@@ -77,7 +77,7 @@
     "lufs_warning": 3.0,
     "tp_max": -2.0,
     "tp_warning": -3.0,
-    "description": "Netflix dialogue-anchored. Target ~ -27 LUFS dialogue, TP max -2 dBTP"
+    "description": "Netflix dialogue-anchored. Target ~ -27 LUFS dialogue, SPK max -2 dBFS"
   },
   "ATSC A/85 (USA Broadcast)": {
     "lufs_target": -24.0,
@@ -85,7 +85,7 @@
     "lufs_warning": 3.0,
     "tp_max": -2.0,
     "tp_warning": -3.0,
-    "description": "USA/Canada broadcast standard. Target -24 LKFS ±2 dB, TP max -2 dBTP"
+    "description": "USA/Canada broadcast standard. Target -24 LKFS ±2 dB, SPK max -2 dBFS"
   },
   "ARIB TR-B32 (Japan)": {
     "lufs_target": -24.0,
@@ -93,7 +93,7 @@
     "lufs_warning": 3.0,
     "tp_max": -1.0,
     "tp_warning": -2.0,
-    "description": "Japanese broadcast standard. Target -24 LUFS, TP max -1 dBTP"
+    "description": "Japanese broadcast standard. Target -24 LUFS, SPK max -1 dBFS"
   },
   "ETSI TS 102 366 (DVB)": {
     "lufs_target": -23.0,
@@ -101,7 +101,7 @@
     "lufs_warning": 3.0,
     "tp_max": -1.0,
     "tp_warning": -2.0,
-    "description": "DVB standard for digital video broadcasting. Target -23 LUFS, TP max -1 dBTP"
+    "description": "DVB standard for digital video broadcasting. Target -23 LUFS, SPK max -1 dBFS"
   },
   "AES77 (Cinema)": {
     "lufs_target": -24.0,
@@ -117,6 +117,6 @@
     "lufs_warning": 3.0,
     "tp_max": -1.0,
     "tp_warning": -2.0,
-    "description": "MPEG-H 3D Audio loudness. Target -24 LUFS, TP max -1 dBTP"
+    "description": "MPEG-H 3D Audio loudness. Target -24 LUFS, SPK max -1 dBFS"
   }
 }
