@@ -19,6 +19,17 @@ Monitor up to 16 audio streams simultaneously with real-time **waveform**, **L/R
 
 ---
 
+## 🏛 Architecture & Performance
+
+To monitor up to 16 stereo streams simultaneously in real-time without GUI freezing or global interpreter lock (GIL) thread contention, AudioStreamMETER implements a professional **DAW-inspired decoupled architecture**:
+
+* **DSP Worker Threads (Audio Engine)**: Every stream card spawns a dedicated background thread ([StreamWorker](file:///home/mintmzu/MyRepos/AudioStreamMETER/src/AudioStreamMETER.py#L407)). This worker reads raw PCM from FFmpeg, applies stateful K-weighting filters (biquad IIR filters carrying state vectors `zi` across chunks), updates raw and pre-filtered ring buffers, and runs short-term FFTs.
+* **UI Rate Throttling**: Background threads decouple their computation rate from the GUI rendering rate. Instead of flooding PyQt with signals on every packet, they throttle UI signal emissions to exactly 20 updates per second (50ms).
+* **Zero-Math GUI Thread**: The main thread does zero DSP math, windowing, or filtering. It simply takes the lightweight pre-computed visual payloads and draws them using fast, hardware-accelerated curves.
+* **Standard-Compliant Metering**: LUFS is computed as K-weighted ungated RMS over sliding 3-second buffers, fully compliant with EBU R128 and ITU-R BS.1770-4 Short-term loudness specifications.
+
+---
+
 ## Project Structure
 
 ```text

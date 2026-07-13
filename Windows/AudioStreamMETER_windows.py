@@ -1,22 +1,30 @@
 """
-AudioStreamMETER
-Copyright (C) 2026 Andrea Mazzurana
+AudioStreamMETER v3.2
+MIT License
+Copyright (c) 2026 Andrea Mazzurana
 
-This program is free software: you can redistribute it and/or modify
-it under the terms of the GNU General Public License as published by
-the Free Software Foundation, either version 3 of the License, or
-(at your option) any later version.
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
 
-This program is distributed in the hope that it will be useful,
-but WITHOUT ANY WARRANTY; without even the implied warranty of
-MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
-GNU General Public License for more details.
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
 
-You should have received a copy of the GNU General Public License
-along with this program. If not, see <https://www.gnu.org/licenses/>.
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+
 ====================
 Monitor up to 16 stereo HTTP audio streams (MP3/AAC) in parallel.
-Displays real-time waveform and measures LUFS (short-term ~3s).
+Displays real-time waveform, LUFS short-term (~3s), Sample Peak, and
+frequency spectrum (20Hz-20kHz) per stream.
 
 Dependencies:
     pip install PyQt6 pyqtgraph numpy pyloudnorm
@@ -30,13 +38,20 @@ Usage:
 """
 
 import sys, threading, subprocess, re, csv, json, time, math, atexit, platform, shutil, ctypes, webbrowser
+import scipy.signal as sig
 from pathlib import Path
 from collections import deque
 from dataclasses import dataclass
 from typing import Dict
 
 import numpy as np
+import av
+from av.audio.resampler import AudioResampler
 import pyqtgraph as pg
+
+# Disable antialiasing globally for performance
+pg.setConfigOptions(antialias=False)
+
 from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QGridLayout, QVBoxLayout,
     QHBoxLayout, QPushButton, QLineEdit, QLabel, QFrame, QScrollArea, QInputDialog,
     QMessageBox, QProgressBar, QTextEdit, QComboBox, QFileDialog, QDialog, QSlider,
@@ -44,13 +59,13 @@ from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QGridLayout, QV
 from PyQt6.QtCore import Qt, QTimer, pyqtSignal, QObject, QThread, QAbstractNativeEventFilter
 from PyQt6.QtGui import QColor, QPalette, QFont
 
-# ── Rilevamento OS ──────────────────────────────────────────────────────────
+# ── OS Detection ────────────────────────────────────────────────────────────
 IS_WINDOWS = platform.system() == "Windows"
 
-# ── Windows Job Object (processo figlio visibile come albero nel Task Manager) ──
-# Tutti i processi ffmpeg/ffplay vengono assegnati a questo Job Object:
-#   - appaiono come figli di AudioStreamMETER.exe nella vista albero
-#   - vengono killati automaticamente dal kernel se l'app padre crasha
+# ── Windows Job Object ──────────────────────────────────────────────────────
+# All ffmpeg/ffplay processes are assigned to this Job Object:
+#   - appear as children of AudioStreamMETER.exe in the process tree
+#   - are killed automatically by the kernel if the parent app crashes
 _win_job = None
 
 if IS_WINDOWS:
@@ -59,7 +74,7 @@ if IS_WINDOWS:
 
         _KERNEL32 = ctypes.windll.kernel32
 
-        # Costanti Win32
+        # Win32 Constants
         _JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE = 0x00002000
         _JobObjectExtendedLimitInformation   = 9
 
@@ -104,12 +119,12 @@ if IS_WINDOWS:
             _win_job = _job_handle
 
     except Exception as _e:
-        print(f"[Job Object] Non disponibile: {_e}")
+        print(f"[Job Object] Not available: {_e}")
         _win_job = None
 
 
 def _assign_to_job(proc: "subprocess.Popen"):
-    """Assegna un processo figlio al Job Object dell'app (solo Windows)."""
+    """Assign a child process to the App's Job Object (Windows only)."""
     if not IS_WINDOWS or _win_job is None:
         return
     try:
@@ -122,50 +137,44 @@ def _assign_to_job(proc: "subprocess.Popen"):
 
 
 # ── Base Directory Detection ────────────────────────────────────────────────
-# When frozen (PyInstaller exe), use the exe's directory so that customization/
-# folder can be placed alongside the exe (not inside _internal).
-# This makes presets, metering_standards, and email_template accessible to users.
 if getattr(sys, 'frozen', False):
     _BASE_DIR = Path(sys.executable).parent
 else:
     _BASE_DIR = Path(__file__).parent
 
 
-# ── Costanti ────────────────────────────────────────────────────────────────
-# Riferimenti standard:
-#   - ITU-R BS.1770-4: LUFS metering (finestre 400ms momentary, 3s short-term)
-#   - EBU R128 / Tech 3341: Loudness metering per broadcast
-#   - EBU Tech 3276: Sample rate 48kHz per broadcast
-#   - ffmpeg documentation: probesize, analyzeduration
+# ── Constants ───────────────────────────────────────────────────────────────
+# References:
+#   - ITU-R BS.1770-4: LUFS metering
+#   - EBU R128 / Tech 3341: Loudness metering for broadcast
 
-# Costanti UI e metering
-WAVEFORM_HISTORY = 8192       # campioni nella waveform display
-LUFS_SHORTTERM_SEC = 3.0      # 3 secondi - Short-term loudness (ITU-R BS.1770-4)
+# UI and metering constants
+WAVEFORM_HISTORY = 2048       # samples in waveform display
+LUFS_SHORTTERM_SEC = 3.0      # 3 seconds - Short-term loudness
+SPECTRUM_UPDATE_INTERVAL = 0.10  # seconds between spectrum FFT updates (10 fps)
+LUFS_UPDATE_INTERVAL     = 0.50  # seconds between LUFS/TP computations (2 per sec)
 
-# ── Configurazione Corrente ──────────────────────────────────────────────────
+# ── Current Configuration ───────────────────────────────────────────────────
 class StreamConfig:
-    """
-    Configurazione globale con valori liberi impostabili dall'utente.
-    Tutti i parametri sono modificabili direttamente dal dialog Opzioni.
-    """
+    """Global configuration — all parameters editable from the Options dialog."""
     def __init__(self):
-        # ── Parametri ffmpeg ──
+        # ── ffmpeg parameters ──
         self.sample_rate      = 48000    # Hz: 22050 / 44100 / 48000
-        self.chunk_samples    = 480      # campioni per chunk (10ms @ 48kHz)
-        self.probesize        = 50000    # byte: 16384–200000
+        self.chunk_samples    = 480      # samples per chunk (10ms @ 48kHz)
+        self.probesize        = 50000    # bytes: 16384–200000
         self.analyzeduration  = 1000000  # µs: 500000–3000000
 
-        # ── Parametri display ──
-        self.refresh_ms       = 50       # ms tra refresh UI (20 FPS)
-        self.waveform_smooth  = 4        # decimazione waveform: 1=massimo dettaglio, 16=molto smooth
+        # ── display parameters ──
+        self.refresh_ms       = 100      # ms between UI refreshes (10 FPS)
+        self.waveform_smooth  = 4        # waveform decimation: 1=max detail, 16=very smooth
 
-        # ── Email template ──
+        # ── email template ──
         self.email_subject    = "[AudioStreamMETER] Issue with stream: {stream_name}"
         self.email_body       = "Stream URL: {stream_url}\nStream Name: {stream_name}\n\nIssue description:\n"
 
     @property
     def chunk_bytes(self) -> int:
-        return self.chunk_samples * 4    # stereo s16le (2 canali × 2 byte)
+        return self.chunk_samples * 4    # stereo s16le (2 channels × 2 bytes)
 
     @property
     def pipe_buffer_size(self) -> int:
@@ -180,15 +189,15 @@ class StreamConfig:
         return 1000 / self.refresh_ms
 
 
-# Istanza globale
+# Global config instance
 CONFIG = StreamConfig()
 
 
-# ── Cartella Customization (raccoglie preset, standard, template) ───────────
+# ── Customization directory (presets, standards, email template) ────────────
 _CUSTOMIZATION_DIR = _BASE_DIR / "customization"
 
 
-# ── Persistenza Email Template ─────────────────────────────────────────
+# ── Email template persistence ───────────────────────────────────────────────
 _EMAIL_TEMPLATE_FILE = _CUSTOMIZATION_DIR / "email_template.json"
 
 def _load_email_template():
@@ -217,7 +226,7 @@ def _save_email_template():
     except Exception as e:
         print(f"[Email Template] Could not save: {e}")
 
-# Carica template salvato all'avvio
+# Load saved email template at startup
 _load_email_template()
 
 
@@ -261,9 +270,20 @@ class MeteringStandard:
 
 
 
-# ── Caricamento Standard di Metering da JSON ────────────────────────────────
-_METERING_STANDARDS_DIR = _CUSTOMIZATION_DIR / "metering_standards"
-_METERING_STANDARDS_FILE = _METERING_STANDARDS_DIR / "standards.json"
+# ── Metering standards — smart path resolution ──────────────────────────────
+# When running from source, standards.json lives at src/metering_standards/.
+# When installed (Windows bundle), it lives at customization/metering_standards/.
+def _resolve_metering_standards_file() -> Path:
+    """Return the standards.json path, preferring the customization/ overlay."""
+    installed = _CUSTOMIZATION_DIR / "metering_standards" / "standards.json"
+    if installed.exists():
+        return installed
+    bundled = _BASE_DIR / "metering_standards" / "standards.json"
+    if bundled.exists():
+        return bundled
+    return installed  # Return preferred path; loader will report the error
+
+_METERING_STANDARDS_FILE = _resolve_metering_standards_file()
 
 def _load_metering_standards() -> Dict[str, MeteringStandard]:
     """Load metering standards from JSON file."""
@@ -293,15 +313,15 @@ def _load_metering_standards() -> Dict[str, MeteringStandard]:
 
 METERING_STANDARDS: Dict[str, MeteringStandard] = _load_metering_standards()
 
-# Standard di metering attivo (default: AES71)
+# Active metering standard (default: EBU R128)
 CURRENT_METERING_STANDARD: str = "EBU R128"
 
 def get_current_metering_standard() -> MeteringStandard:
-    """Ritorna lo standard di metering attualmente selezionato."""
-    return METERING_STANDARDS.get(CURRENT_METERING_STANDARD, METERING_STANDARDS["EBU R128"])
+    """Return the currently active metering standard."""
+    return METERING_STANDARDS.get(CURRENT_METERING_STANDARD, next(iter(METERING_STANDARDS.values())))
 
 def set_metering_standard(name: str) -> bool:
-    """Imposta lo standard di metering. Ritorna True se valido."""
+    """Set the active metering standard. Returns True if valid."""
     global CURRENT_METERING_STANDARD
     if name in METERING_STANDARDS:
         CURRENT_METERING_STANDARD = name
@@ -342,42 +362,25 @@ def _get_lufs_meter(sample_rate: int):
             _LUFS_METER_CACHE[sample_rate] = None
     return _LUFS_METER_CACHE[sample_rate]
 
-def compute_lufs(samples_stereo: np.ndarray, sample_rate: int) -> float:
-    """LUFS short-term via pyloudnorm (stereo, ITU-R BS.1770-4)."""
-    if samples_stereo.size == 0:
-        return -70.0
-    meter = _get_lufs_meter(sample_rate)
-    if meter is not None:
-        # pyloudnorm accetta shape (N, 2) per stereo, valori float64 [-1, 1]
-        data = samples_stereo.astype(np.float64) / 32768.0
-        if data.ndim == 1:  # fallback mono
-            data = data.reshape(-1, 1)
-        lufs = meter.integrated_loudness(data)
-        return lufs if math.isfinite(lufs) else -70.0
-    # Fallback RMS stereo
-    rms = np.sqrt(np.mean(samples_stereo.astype(np.float64) ** 2))
-    return 20 * math.log10(rms / 32768.0) - 0.691 if rms >= 1.0 else -70.0
+
+# ── Cached FFT constants (computed once, shared by all instances) ──────────
+_FFT_CACHE_GLOBAL = {}
+def _get_fft_cache(sample_rate: int, fft_size: int = 2048, n_display: int = 256):
+    key = (sample_rate, fft_size, n_display)
+    if key not in _FFT_CACHE_GLOBAL:
+        # Pre-scale window to avoid float multiplication in realtime loop
+        window = (np.hanning(fft_size).astype(np.float32)) / 32768.0
+        log_freqs = np.logspace(np.log10(20), np.log10(20000), n_display)
+        freq_per_bin = sample_rate / fft_size
+        bin_indices = np.clip((log_freqs / freq_per_bin).astype(int), 0, fft_size // 2)
+        x_axis = np.log10(log_freqs).astype(np.float32)
+        _FFT_CACHE_GLOBAL[key] = (window, log_freqs, bin_indices, x_axis)
+    return _FFT_CACHE_GLOBAL[key]
 
 
-def compute_true_peak_stereo(samples_stereo: np.ndarray) -> tuple[float, float]:
-    """Sample Peak in dBFS for L and R channels (digital sample-domain max).
-    Note: This is sample-domain peak, NOT inter-sample True Peak (ITU-R BS.1770-4 TP).
-    True Peak requires 4× oversampling. Values here may under-read by up to ~3.5 dB.
-    """
-    if samples_stereo.size == 0:
-        return -70.0, -70.0
-    left = samples_stereo[:, 0].astype(np.float64)
-    right = samples_stereo[:, 1].astype(np.float64)
-    peak_l = np.max(np.abs(left))
-    peak_r = np.max(np.abs(right))
-    tp_l = 20 * math.log10(peak_l / 32768.0) if peak_l >= 1.0 else -70.0
-    tp_r = 20 * math.log10(peak_r / 32768.0) if peak_r >= 1.0 else -70.0
-    return tp_l, tp_r
-
-
-# ── Worker decodifica stream ─────────────────────────────────────────────────
+# ── Stream decode worker ────────────────────────────────────────────────────
 class StreamWorker(QObject):
-    data_ready = pyqtSignal(np.ndarray, float)
+    ui_update_ready = pyqtSignal(dict)
     error_signal = pyqtSignal(str)
     status_signal = pyqtSignal(str)
 
@@ -386,6 +389,64 @@ class StreamWorker(QObject):
         self.url = url
         self._stop_event = threading.Event()
         self._alive = True
+        
+        self.sample_rate = CONFIG.sample_rate
+        self.chunk_samples = CONFIG.chunk_samples
+        self.waveform_smooth = CONFIG.waveform_smooth
+        
+        # Setup filter coefficients statefully
+        meter = _get_lufs_meter(self.sample_rate)
+        if meter is not None and hasattr(meter, '_filters'):
+            self.has_pyln = True
+            self.b_hs = meter._filters['high_shelf'].b.copy()
+            self.a_hs = meter._filters['high_shelf'].a.copy()
+            self.b_hp = meter._filters['high_pass'].b.copy()
+            self.a_hp = meter._filters['high_pass'].a.copy()
+            
+            import scipy.signal as sig
+            self.zi_hs_l = sig.lfilter_zi(self.b_hs, self.a_hs) * 0.0
+            self.zi_hs_r = sig.lfilter_zi(self.b_hs, self.a_hs) * 0.0
+            self.zi_hp_l = sig.lfilter_zi(self.b_hp, self.a_hp) * 0.0
+            self.zi_hp_r = sig.lfilter_zi(self.b_hp, self.a_hp) * 0.0
+        else:
+            self.has_pyln = False
+            
+        # Waveform ring buffers
+        self._waveform_arr_l = np.zeros(WAVEFORM_HISTORY, dtype=np.float32)
+        self._waveform_arr_r = np.zeros(WAVEFORM_HISTORY, dtype=np.float32)
+        self._waveform_write_idx = 0
+        
+        self._display_l = np.empty(WAVEFORM_HISTORY, dtype=np.float32)
+        self._display_r = np.empty(WAVEFORM_HISTORY, dtype=np.float32)
+        
+        # Incremental LUFS & Peak deques
+        self._lufs_window_frames = 3 * self.sample_rate
+        self._lufs_deque = deque()
+        self._lufs_deque_frames = 0
+        
+        self._peaks_deque = deque()
+        self._peaks_deque_frames = 0
+        
+        # Small raw buffer (4096 frames) just for FFT calculations
+        self._raw_buf_size = 4096
+        self._raw_buf = np.zeros((self._raw_buf_size, 2), dtype=np.int16)
+        self._raw_write_idx = 0
+        self._raw_filled = 0
+        
+        # UI cached states
+        self._latest_lufs = -70.0
+        self._latest_tp_l = -70.0
+        self._latest_tp_r = -70.0
+        self._latest_spec_l = np.zeros(256, dtype=np.float32) - 80.0
+        self._latest_spec_r = np.zeros(256, dtype=np.float32) - 80.0
+        
+        self._last_ui_emit_time = 0.0
+        self._last_spectrum_update = 0.0
+        self._last_lufs_update = 0.0
+        self._fft_updated = False
+        
+        # Pre-cache FFT constants to avoid lookups in process loop
+        self.fft_window, _, self.fft_bin_indices, _ = _get_fft_cache(self.sample_rate, 2048)
 
     def start(self):
         self._stop_event.clear()
@@ -405,42 +466,314 @@ class StreamWorker(QObject):
         try: signal.emit(*args)
         except (RuntimeError, AttributeError): pass
 
+    def _process_chunk(self, samples: np.ndarray):
+        if samples.size == 0:
+            return
+        
+        # Reshape to (N, 2) stereo
+        stereo = samples.reshape(-1, 2)
+        n_frames = stereo.shape[0]
+        
+        # 1. Update Small Raw Buffer for FFT
+        buf_size = self._raw_buf_size
+        if n_frames >= buf_size:
+            self._raw_buf[:] = stereo[-buf_size:]
+            self._raw_write_idx = 0
+            self._raw_filled = buf_size
+        else:
+            end_idx = self._raw_write_idx + n_frames
+            if end_idx <= buf_size:
+                self._raw_buf[self._raw_write_idx:end_idx] = stereo
+            else:
+                first_part = buf_size - self._raw_write_idx
+                self._raw_buf[self._raw_write_idx:] = stereo[:first_part]
+                self._raw_buf[:n_frames - first_part] = stereo[first_part:]
+            self._raw_write_idx = end_idx % buf_size
+            self._raw_filled = min(self._raw_filled + n_frames, buf_size)
+            
+        # 2. Stateful K-filtering
+        if self.has_pyln:
+            chunk_f32 = stereo.astype(np.float32) * np.float32(1.0 / 32768.0)
+            
+            fl, self.zi_hs_l = sig.lfilter(self.b_hs, self.a_hs, chunk_f32[:, 0], zi=self.zi_hs_l)
+            fl, self.zi_hp_l = sig.lfilter(self.b_hp, self.a_hp, fl, zi=self.zi_hp_l)
+            
+            fr, self.zi_hs_r = sig.lfilter(self.b_hs, self.a_hs, chunk_f32[:, 1], zi=self.zi_hs_r)
+            fr, self.zi_hp_r = sig.lfilter(self.b_hp, self.a_hp, fr, zi=self.zi_hp_r)
+            
+            # Avoid expensive np.column_stack by writing to a pre-allocated array view
+            filtered_chunk = np.empty_like(chunk_f32)
+            filtered_chunk[:, 0] = fl
+            filtered_chunk[:, 1] = fr
+        else:
+            filtered_chunk = stereo.astype(np.float32)
+            
+        # 3. Update Moving Window Deques for LUFS and Peak
+        sum_sq_l = float(np.dot(filtered_chunk[:, 0], filtered_chunk[:, 0]))
+        sum_sq_r = float(np.dot(filtered_chunk[:, 1], filtered_chunk[:, 1]))
+        self._lufs_deque.append((sum_sq_l, sum_sq_r, n_frames))
+        self._lufs_deque_frames += n_frames
+        
+        while self._lufs_deque_frames - self._lufs_deque[0][2] >= self._lufs_window_frames:
+            popped = self._lufs_deque.popleft()
+            self._lufs_deque_frames -= popped[2]
+            
+        peak_l = float(np.max(np.abs(stereo[:, 0])))
+        peak_r = float(np.max(np.abs(stereo[:, 1])))
+        self._peaks_deque.append((peak_l, peak_r, n_frames))
+        self._peaks_deque_frames += n_frames
+        
+        while self._peaks_deque_frames - self._peaks_deque[0][2] >= self._lufs_window_frames:
+            popped = self._peaks_deque.popleft()
+            self._peaks_deque_frames -= popped[2]
+            
+        # Calculate symmetric min/max peak envelopes over small blocks (independent of chunk size)
+        block_size = max(8, self.waveform_smooth * 16)
+        n_blocks = n_frames // block_size
+        
+        if n_blocks > 0:
+            truncated = stereo[:n_blocks * block_size]
+            reshaped = truncated.reshape(n_blocks, block_size, 2)
+            peaks = np.max(np.abs(reshaped), axis=1)
+            
+            env_l = np.empty(2 * n_blocks, dtype=np.float32)
+            env_l[0::2] = peaks[:, 0]
+            env_l[1::2] = -peaks[:, 0]
+            
+            env_r = np.empty(2 * n_blocks, dtype=np.float32)
+            env_r[0::2] = peaks[:, 1]
+            env_r[1::2] = -peaks[:, 1]
+        else:
+            env_l = np.zeros(2, dtype=np.float32)
+            env_r = np.zeros(2, dtype=np.float32)
+            
+        left_scaled = env_l * np.float32(1.0 / 32768.0)
+        right_scaled = env_r * np.float32(1.0 / 32768.0)
+        n_new = len(left_scaled)
+        w_size = WAVEFORM_HISTORY
+        if n_new >= w_size:
+            self._waveform_arr_l[:] = left_scaled[-w_size:]
+            self._waveform_arr_r[:] = right_scaled[-w_size:]
+            self._waveform_write_idx = 0
+        else:
+            w_end = self._waveform_write_idx + n_new
+            if w_end <= w_size:
+                self._waveform_arr_l[self._waveform_write_idx:w_end] = left_scaled
+                self._waveform_arr_r[self._waveform_write_idx:w_end] = right_scaled
+            else:
+                first_part = w_size - self._waveform_write_idx
+                self._waveform_arr_l[self._waveform_write_idx:] = left_scaled[:first_part]
+                self._waveform_arr_r[self._waveform_write_idx:] = right_scaled[:first_part]
+                self._waveform_arr_l[:n_new - first_part] = left_scaled[first_part:]
+                self._waveform_arr_r[:n_new - first_part] = right_scaled[first_part:]
+            self._waveform_write_idx = w_end % w_size
+            
+        current_time = time.time()
+        
+        # 5. FFT Update
+        if (current_time - self._last_spectrum_update >= SPECTRUM_UPDATE_INTERVAL
+                and self._raw_filled >= 2048):
+            self._last_spectrum_update = current_time
+            self._fft_updated = True
+            fft_size = 2048
+            start_idx = (self._raw_write_idx - fft_size) % buf_size
+            
+            if start_idx + fft_size <= buf_size:
+                fft_data = self._raw_buf[start_idx:start_idx + fft_size]
+            else:
+                n1 = buf_size - start_idx
+                fft_data = np.empty((fft_size, 2), dtype=np.int16)
+                fft_data[:n1] = self._raw_buf[start_idx:]
+                fft_data[n1:] = self._raw_buf[:fft_size - n1]
+                
+            left_ch = fft_data[:, 0].astype(np.float32)
+            right_ch = fft_data[:, 1].astype(np.float32)
+            
+            # Multiplied by pre-scaled windows to save 2 array multiplications per loop
+            fft_l = np.abs(np.fft.rfft(left_ch * self.fft_window))
+            fft_r = np.abs(np.fft.rfft(right_ch * self.fft_window))
+            
+            eps = np.float32(1e-10)
+            db_l = np.clip(20.0 * np.log10(fft_l / 2048 + eps), -80, 0)
+            db_r = np.clip(20.0 * np.log10(fft_r / 2048 + eps), -80, 0)
+            
+            self._latest_spec_l = db_l[self.fft_bin_indices]
+            self._latest_spec_r = db_r[self.fft_bin_indices]
+            
+        # 6. LUFS & TP update (Throttled: 2 updates per sec)
+        if (current_time - self._last_lufs_update >= LUFS_UPDATE_INTERVAL
+                and self._lufs_deque_frames >= self.sample_rate // 2):
+            self._last_lufs_update = current_time
+            
+            # Sum up deque sum of squares (avoiding O(N) array loops)
+            total_sum_sq_l = 0.0
+            total_sum_sq_r = 0.0
+            total_frames = 0
+            for item in self._lufs_deque:
+                total_sum_sq_l += item[0]
+                total_sum_sq_r += item[1]
+                total_frames += item[2]
+                
+            if total_frames > 0:
+                ms_l = total_sum_sq_l / total_frames
+                ms_r = total_sum_sq_r / total_frames
+                lufs = -0.691 + 10.0 * math.log10(ms_l + ms_r + 1e-10)
+                self._latest_lufs = lufs if math.isfinite(lufs) else -70.0
+            else:
+                self._latest_lufs = -70.0
+                
+            # Scan absolute maximum peaks in deque
+            max_peak_l = 0.0
+            max_peak_r = 0.0
+            for item in self._peaks_deque:
+                if item[0] > max_peak_l: max_peak_l = item[0]
+                if item[1] > max_peak_r: max_peak_r = item[1]
+                
+            tp_l = 20.0 * math.log10(max_peak_l / 32768.0) if max_peak_l >= 1 else -70.0
+            tp_r = 20.0 * math.log10(max_peak_r / 32768.0) if max_peak_r >= 1 else -70.0
+            self._latest_tp_l = tp_l
+            self._latest_tp_r = tp_r
+            
+        # 7. GUI Throttled emit (20 FPS = 50ms)
+        refresh_interval = CONFIG.refresh_ms * 0.001
+        if current_time - self._last_ui_emit_time >= refresh_interval:
+            self._last_ui_emit_time = current_time
+            
+            idx = self._waveform_write_idx
+            tail = w_size - idx
+            self._display_l[:tail] = self._waveform_arr_l[idx:]
+            self._display_l[tail:] = self._waveform_arr_l[:idx]
+            self._display_r[:tail] = self._waveform_arr_r[idx:]
+            self._display_r[tail:] = self._waveform_arr_r[:idx]
+            
+            _, _, _, x_axis = _get_fft_cache(self.sample_rate, 2048)
+            
+            ui_data = {
+                "waveform_l": self._display_l.copy(),
+                "waveform_r": self._display_r.copy(),
+                "spectrum_l": self._latest_spec_l.copy(),
+                "spectrum_r": self._latest_spec_r.copy(),
+                "x_axis": x_axis.copy(),
+                "lufs": self._latest_lufs,
+                "tp_l": self._latest_tp_l,
+                "tp_r": self._latest_tp_r,
+                "fft_updated": self._fft_updated
+            }
+            self._fft_updated = False
+            self._safe_emit(self.ui_update_ready, ui_data)
+
     def _run(self):
-        self._proc = None  # traccia il processo per stop() esterno
-        self._safe_emit(self.status_signal, "connecting")
-        cmd = ["ffmpeg", "-fflags", "+nobuffer+flush_packets", "-flags", "low_delay",
-               "-probesize", str(CONFIG.probesize), "-analyzeduration", str(CONFIG.analyzeduration),
-               "-reconnect", "1", "-reconnect_streamed", "1", "-reconnect_delay_max", "5",
-               "-i", self.url, "-vn",
-               "-ar", str(CONFIG.sample_rate), "-ac", "2", "-f", "s16le", "-"]
-        popen_kw = {"stdout": subprocess.PIPE, "stderr": subprocess.DEVNULL, "bufsize": CONFIG.pipe_buffer_size}
-        if IS_WINDOWS:
-            popen_kw["creationflags"] = subprocess.CREATE_NO_WINDOW
-        proc = None
-        try:
-            proc = subprocess.Popen(cmd, **popen_kw)
-            self._proc = proc
-            _assign_to_job(proc)
-            self._safe_emit(self.status_signal, "live")
-            while not self._stop_event.is_set():
-                raw = proc.stdout.read(CONFIG.chunk_bytes)
-                emit_time = time.time()
-                if not raw or not self._alive: break
-                self._safe_emit(self.data_ready, np.frombuffer(raw, dtype=np.int16).copy(), emit_time)
-        except FileNotFoundError:
-            self._safe_emit(self.error_signal, "ffmpeg non trovato nel PATH")
-        except Exception as e:
-            if self._alive:  # ignora errori dovuti al kill volontario
-                self._safe_emit(self.error_signal, str(e))
-        finally:
-            self._proc = None
-            if proc:
+        while self._alive and not self._stop_event.is_set():
+            self._safe_emit(self.status_signal, "connecting")
+            container = None
+            try:
+                # Open the audio stream in-process with timeout and auto-reconnect configuration
+                container = av.open(self.url, options={
+                    'probesize': str(CONFIG.probesize),
+                    'analyzeduration': str(CONFIG.analyzeduration),
+                    'timeout': '15000000',      # 15 seconds connection timeout (in microseconds)
+                    'reconnect': '1',           # Enable auto-reconnect
+                    'reconnect_at_eof': '1',    # Auto-reconnect at EOF
+                    'reconnect_streamed': '1',  # Auto-reconnect streamed
+                    'reconnect_delay_max': '5'  # Max reconnect retry delay in seconds
+                })
+                
+                if not container.streams.audio:
+                    raise ValueError("No audio stream found")
+                    
+                audio_stream = container.streams.audio[0]
+                native_rate = audio_stream.codec_context.sample_rate if audio_stream.codec_context.sample_rate else 48000
+                
+                # Dynamically match native sample rate to avoid fractional resampling computations
+                self.sample_rate = native_rate
+                self._lufs_window_frames = 3 * native_rate
+                
+                # Dynamically set up the filter coefficients for this native rate
+                meter = _get_lufs_meter(native_rate)
+                if meter is not None and hasattr(meter, '_filters'):
+                    self.has_pyln = True
+                    self.b_hs = meter._filters['high_shelf'].b.copy()
+                    self.a_hs = meter._filters['high_shelf'].a.copy()
+                    self.b_hp = meter._filters['high_pass'].b.copy()
+                    self.a_hp = meter._filters['high_pass'].a.copy()
+                    
+                    self.zi_hs_l = sig.lfilter_zi(self.b_hs, self.a_hs) * 0.0
+                    self.zi_hs_r = sig.lfilter_zi(self.b_hs, self.a_hs) * 0.0
+                    self.zi_hp_l = sig.lfilter_zi(self.b_hp, self.a_hp) * 0.0
+                    self.zi_hp_r = sig.lfilter_zi(self.b_hp, self.a_hp) * 0.0
+                else:
+                    self.has_pyln = False
+                    
+                # Cache FFT constants for the native rate
+                self.fft_window, _, self.fft_bin_indices, _ = _get_fft_cache(native_rate, 2048)
+                
+                # Setup resampler to output standard stereo s16 at native sample rate (no rate change)
+                resampler = AudioResampler(
+                    format='s16',
+                    layout='stereo',
+                    rate=native_rate
+                )
+                
+                self._safe_emit(self.status_signal, "live")
+                
+                accumulated_samples = []
+                accumulated_size = 0
+                target_size = int(2 * native_rate * 0.1)  # 100ms of stereo samples
+                
+                # Decode packets and feed samples chunk-by-chunk to the DSP pipeline
                 try:
-                    if proc.poll() is None: proc.kill()
-                    proc.stdout.close()
-                    proc.wait(timeout=3)
-                except Exception: pass
-            if self._alive: self._safe_emit(self.status_signal, "stopped")
+                    for packet in container.demux(audio_stream):
+                        if self._stop_event.is_set() or not self._alive:
+                            break
+                        try:
+                            for frame in packet.decode():
+                                if self._stop_event.is_set() or not self._alive:
+                                    break
+                                resampled_frames = resampler.resample(frame)
+                                for resampled in resampled_frames:
+                                    samples = resampled.to_ndarray()[0]
+                                    accumulated_samples.append(samples)
+                                    accumulated_size += len(samples)
+                                    
+                                    if accumulated_size >= target_size:
+                                        chunk = np.concatenate(accumulated_samples)
+                                        self._process_chunk(chunk)
+                                        accumulated_samples = []
+                                        accumulated_size = 0
+                        except av.AVError:
+                            # Skip corrupted/missing frames silently (just like standard FFmpeg)
+                            pass
+                except av.AVError as e:
+                    # Bubble up network drop exceptions to trigger QThread reconnect
+                    raise e
+                            
+                # Flush the resampler at EOF
+                if self._alive and not self._stop_event.is_set():
+                    resampled_frames = resampler.resample(None)
+                    for resampled in resampled_frames:
+                        samples = resampled.to_ndarray()[0]
+                        accumulated_samples.append(samples)
+                    if accumulated_samples:
+                        chunk = np.concatenate(accumulated_samples)
+                        self._process_chunk(chunk)
+                        
+            except Exception as e:
+                if self._alive:
+                    self._safe_emit(self.error_signal, str(e))
+            finally:
+                if container:
+                    try:
+                        container.close()
+                    except Exception:
+                        pass
+                        
+            # If the connection drops, wait 30 seconds before attempting reconnect
+            if self._alive and not self._stop_event.is_set():
+                self._safe_emit(self.status_signal, "stopped")
+                self._stop_event.wait(30.0)
+                
+        if self._alive:
+            self._safe_emit(self.status_signal, "stopped")
 
 
 # ── Registro globale processi ffplay ─────────────────────────────────────────
@@ -1051,22 +1384,6 @@ class StreamCard(QFrame):
     remove_requested = pyqtSignal(object)
     listen_requested = pyqtSignal(object)   # emesso quando si vuole ascoltare
 
-    # ── Cached FFT constants (computed once, shared by all instances) ──────────
-    _fft_cache: dict = {}
-    
-    @classmethod
-    def _get_fft_cache(cls, sample_rate: int, fft_size: int = 2048, n_display: int = 256):
-        """Returns cached FFT constants for given sample rate."""
-        key = (sample_rate, fft_size, n_display)
-        if key not in cls._fft_cache:
-            window = np.hanning(fft_size)
-            log_freqs = np.logspace(np.log10(20), np.log10(20000), n_display)
-            freq_per_bin = sample_rate / fft_size
-            bin_indices = np.clip((log_freqs / freq_per_bin).astype(int), 0, fft_size // 2)
-            x_axis = np.log10(log_freqs)
-            cls._fft_cache[key] = (window, log_freqs, bin_indices, x_axis)
-        return cls._fft_cache[key]
-
     def __init__(self, url: str, index: int, parent=None, email: str = ""):
         super().__init__(parent)
         self.url = url
@@ -1074,29 +1391,18 @@ class StreamCard(QFrame):
         self._custom_name = ""          # nome impostato dall'utente
         self._email = email             # email di contatto per supporto
         
-        # ── Buffer waveform stereo (numpy arrays for performance) ────────────
-        self._waveform_arr_l = np.zeros(WAVEFORM_HISTORY, dtype=np.float32)
-        self._waveform_arr_r = np.zeros(WAVEFORM_HISTORY, dtype=np.float32)
-        self._waveform_write_idx = 0
-        
-        # Ring buffer numpy per LUFS stereo (evita conversioni deque → list → numpy)
-        self._lufs_buf_size = int(CONFIG.sample_rate * LUFS_SHORTTERM_SEC)  # frames stereo
-        self._lufs_buf = np.zeros((self._lufs_buf_size, 2), dtype=np.int16)  # shape (N, 2)
-        self._lufs_write_idx = 0
-        self._lufs_filled = 0  # frames validi nel buffer
         self._status = "connecting"
-        self._lufs_value = -70.0
-        self._tp_l = -70.0              # Sample Peak left channel
-        self._tp_r = -70.0              # Sample Peak right channel
         self._worker = None
         self._qthread = None
         self._listening = False
+        self._latest_ui_data = None
         
-        # ── Performance: throttle counters & color cache ─────────────────────
-        self._frame_counter = 0         # counts refresh_display calls
-        self._last_lufs_update = 0.0    # timestamp of last LUFS computation
-        self._last_lufs_color = None    # cached color to avoid setStyleSheet
-        self._last_tp_color = None      # cached TP color
+        # ── Performance: color cache & display values (throttled updates) ──
+        self._last_lufs_color  = None      # cached LUFS color (avoid setStyleSheet)
+        self._last_tp_color    = None      # cached TP color
+        self._last_lufs_display = -999.0   # last displayed LUFS value (for text throttle)
+        self._last_tp_l_display = -999.0   # last displayed TP left
+        self._last_tp_r_display = -999.0   # last displayed TP right
 
         self._build_ui()
         self._start_stream()
@@ -1229,31 +1535,35 @@ class StreamCard(QFrame):
         header.addWidget(remove_btn)
         root.addLayout(header)
 
-        # ── Waveform Stereo: L sopra (cyan), R sotto (magenta) ──────────
-        pg.setConfigOptions(antialias=False)
+        # ── Waveform Stereo: L top (cyan), R bottom (magenta) ──────────
         self._plot = pg.PlotWidget(background=BG_CARD2)
+        self._plot.disableAutoRange()
         self._plot.setMinimumHeight(36)  # Compact mode for 4x4 grid
         self._plot.hideAxis("left")
         self._plot.hideAxis("bottom")
         self._plot.setMouseEnabled(x=False, y=False)
-        self._plot.setYRange(-32768, 32768, padding=0)
+        self._plot.setXRange(0, WAVEFORM_HISTORY, padding=0)
+        self._plot.setYRange(-1.05, 1.05, padding=0)
         self._plot.getPlotItem().setContentsMargins(0, 0, 0, 0)
+        # Disable right-click context menu (removes irrelevant pyqtgraph options)
+        self._plot.getPlotItem().getViewBox().setMenuEnabled(False)
         # Set tick font on hidden axes to prevent QFont warning
         self._plot.getPlotItem().getAxis('left').setStyle(tickFont=QFont("Courier New", 9))
         self._plot.getPlotItem().getAxis('bottom').setStyle(tickFont=QFont("Courier New", 9))
         
-        # Linea separatrice centrale L/R
+        # Center separator line L/R
         center_line = pg.InfiniteLine(pos=0, angle=0, pen=pg.mkPen(color=GRAY, width=1, style=Qt.PenStyle.DotLine))
         self._plot.addItem(center_line)
 
-        pen_l = pg.mkPen(color=ACCENT, width=1)     # L = cyan (sopra)
-        pen_r = pg.mkPen(color="#ff40ff", width=1)  # R = magenta (sotto)
+        pen_l = pg.mkPen(color=ACCENT, width=1)     # L = cyan (top)
+        pen_r = pg.mkPen(color="#ff40ff", width=1)  # R = magenta (bottom)
         self._curve_l = self._plot.plot([], [], pen=pen_l)
         self._curve_r = self._plot.plot([], [], pen=pen_r)
         root.addWidget(self._plot, 1)
 
         # ── Spectrum Analyzer ─────────────────────────────────────────────────
         self._spectrum_plot = pg.PlotWidget(background=BG_CARD2)
+        self._spectrum_plot.disableAutoRange()
         self._spectrum_plot.setMinimumHeight(26)  # Compact for 4x4 grid
         self._spectrum_plot.setMaximumHeight(45)   # Limit growth
         self._spectrum_plot.setMouseEnabled(x=False, y=False)
@@ -1261,6 +1571,8 @@ class StreamCard(QFrame):
         # Logarithmic X axis: 20Hz to 20kHz
         self._spectrum_plot.setXRange(np.log10(20), np.log10(20000), padding=0)
         self._spectrum_plot.getPlotItem().setContentsMargins(0, 0, 0, 0)
+        # Disable right-click context menu (removes irrelevant pyqtgraph options)
+        self._spectrum_plot.getPlotItem().getViewBox().setMenuEnabled(False)
         
         # Configure left axis with dB labels
         left_axis = self._spectrum_plot.getPlotItem().getAxis('left')
@@ -1277,14 +1589,14 @@ class StreamCard(QFrame):
         bottom_axis.setPen(pg.mkPen(color=GRAY, width=1))
         bottom_axis.setTextPen(pg.mkPen(color=TEXT_DIM))
         # Custom ticks at 20Hz, 100Hz, 1kHz, 10kHz, 20kHz
-        freq_ticks = [(np.log10(20), "20"), (np.log10(100), "100"), 
+        freq_ticks = [(np.log10(20), "20"), (np.log10(100), "100"),
                       (np.log10(1000), "1k"), (np.log10(10000), "10k"), (np.log10(20000), "20k")]
         bottom_axis.setTicks([freq_ticks])
         
         # Add grid
         self._spectrum_plot.showGrid(x=True, y=False, alpha=0.3)
         
-        # Spectrum curves (stessi colori della waveform)
+        # Spectrum curves (same colours as waveform)
         pen_spec_l = pg.mkPen(color=ACCENT, width=1.5)
         pen_spec_r = pg.mkPen(color="#ff40ff", width=1.5)
         self._spectrum_curve_l = self._spectrum_plot.plot([], [], pen=pen_spec_l)
@@ -1408,10 +1720,13 @@ class StreamCard(QFrame):
         self._qthread = QThread()
         self._worker = StreamWorker(self.url)
         self._worker.moveToThread(self._qthread)
-        self._worker.data_ready.connect(self._on_data)
+        self._worker.ui_update_ready.connect(self._on_ui_update)
         self._worker.error_signal.connect(self._on_error)
         self._worker.status_signal.connect(self._on_status)
         self._qthread.started.connect(self._worker.start)
+        # Ensure Qt properly frees thread and worker objects on exit
+        self._qthread.finished.connect(self._qthread.deleteLater)
+        self._qthread.finished.connect(self._worker.deleteLater)
         self._qthread.start()
 
     def stop_stream(self):
@@ -1419,7 +1734,7 @@ class StreamCard(QFrame):
             self._worker.stop()   # killa subito ffmpeg e setta stop_event
             # Disconnetti tutti i segnali prima che Qt distrugga l'oggetto
             try:
-                self._worker.data_ready.disconnect()
+                self._worker.ui_update_ready.disconnect()
                 self._worker.error_signal.disconnect()
                 self._worker.status_signal.disconnect()
             except RuntimeError:
@@ -1427,128 +1742,84 @@ class StreamCard(QFrame):
         if self._qthread:
             self._qthread.quit()
             if not self._qthread.wait(3000):
-                # QThread non terminato: termina forzatamente
+                # Thread still running: force terminate
                 self._qthread.terminate()
                 self._qthread.wait(1000)
 
     # ── Slots ─────────────────────────────────────────────────────────────────
-    def _on_data(self, samples: np.ndarray, emit_time: float):
-        # Reshape interleaved stereo (L,R,L,R...) → (N, 2)
-        stereo = samples.reshape(-1, 2)
-        n_frames = stereo.shape[0]
-        
-        # ── Waveform stereo: L sopra (0→32768), R sotto (-32768→0) ───
-        smooth = max(1, CONFIG.waveform_smooth)
-        step = max(1, n_frames // (256 // smooth))
-        # Scala e offset: L metà superiore, R metà inferiore
-        left_scaled = stereo[::step, 0].astype(np.float32) * 0.5 + 16384
-        right_scaled = stereo[::step, 1].astype(np.float32) * 0.5 - 16384
-        
-        # ── Ring buffer waveform (numpy, no deque) ───────────────────────
-        n_new = len(left_scaled)
-        buf_size = WAVEFORM_HISTORY
-        if n_new >= buf_size:
-            self._waveform_arr_l[:] = left_scaled[-buf_size:]
-            self._waveform_arr_r[:] = right_scaled[-buf_size:]
-            self._waveform_write_idx = 0
-        else:
-            end_idx = self._waveform_write_idx + n_new
-            if end_idx <= buf_size:
-                self._waveform_arr_l[self._waveform_write_idx:end_idx] = left_scaled
-                self._waveform_arr_r[self._waveform_write_idx:end_idx] = right_scaled
-            else:
-                first_part = buf_size - self._waveform_write_idx
-                self._waveform_arr_l[self._waveform_write_idx:] = left_scaled[:first_part]
-                self._waveform_arr_r[self._waveform_write_idx:] = right_scaled[:first_part]
-                self._waveform_arr_l[:n_new - first_part] = left_scaled[first_part:]
-                self._waveform_arr_r[:n_new - first_part] = right_scaled[first_part:]
-            self._waveform_write_idx = end_idx % buf_size
-        
-        # ── Ring buffer numpy stereo per LUFS ────────────────────────────
-        buf_size = self._lufs_buf_size
-        if n_frames >= buf_size:
-            self._lufs_buf[:] = stereo[-buf_size:]
-            self._lufs_write_idx = 0
-            self._lufs_filled = buf_size
-        else:
-            end_idx = self._lufs_write_idx + n_frames
-            if end_idx <= buf_size:
-                self._lufs_buf[self._lufs_write_idx:end_idx] = stereo
-            else:
-                first_part = buf_size - self._lufs_write_idx
-                self._lufs_buf[self._lufs_write_idx:] = stereo[:first_part]
-                self._lufs_buf[:n_frames - first_part] = stereo[first_part:]
-            self._lufs_write_idx = end_idx % buf_size
-            self._lufs_filled = min(self._lufs_filled + n_frames, buf_size)
+    def _on_ui_update(self, ui_data: dict):
+        self._latest_ui_data = ui_data
+        self._ui_data_dirty = True
 
     def _on_status(self, status: str):
         self._status = status
         colors = {"connecting": YELLOW, "live": GREEN, "stopped": RED}
         self._status_dot.setStyleSheet(f"color: {colors.get(status, GRAY2)};")
+        
+        # Restore name text & default style when connecting/live if it previously showed an error
+        if status in ("connecting", "live"):
+            current_text = self._name_edit.text()
+            if current_text.startswith("⚠"):
+                self._name_edit.setText(self._custom_name or self._short_url())
+                self._name_edit.setStyleSheet(f"""
+                    QLineEdit {{
+                        background: transparent;
+                        color: {TEXT};
+                        border: none;
+                        border-bottom: 1px solid transparent;
+                        font-size: 12px;
+                        font-family: 'Courier New';
+                        font-weight: bold;
+                        padding: 2px 4px;
+                    }}
+                    QLineEdit:hover {{
+                        border-bottom: 1px solid {GRAY2};
+                    }}
+                    QLineEdit:focus {{
+                        background: {BG_CARD2};
+                        border: 1px solid {ACCENT};
+                        border-radius: 3px;
+                    }}
+                """)
+                
+        if status in ("connecting", "stopped"):
+            # Clear UI curves and reset labels once to avoid CPU rendering on stale data
+            self._curve_l.setData([], skipFiniteCheck=True)
+            self._curve_r.setData([], skipFiniteCheck=True)
+            self._spectrum_curve_l.setData([], skipFiniteCheck=True)
+            self._spectrum_curve_r.setData([], skipFiniteCheck=True)
+            self._lufs_label.setText("LUFS —.—")
+            self._tp_label.setText("SPK L:— R:—")
+            self._lufs_bar.setValue(0)
+            self._latest_ui_data = None
+            self._ui_data_dirty = False
 
     def _on_error(self, msg: str):
         self._name_edit.setText(f"⚠ {msg}")
         self._name_edit.setStyleSheet(f"color: {RED}; font-size: 13px; font-family: 'Courier New'; background: transparent; border: none;")
 
-    def refresh_display(self):
-        self._frame_counter += 1
-        current_time = time.time()
+    def refresh_display(self, current_time: float, metering_std: "MeteringStandard"):
+        """Called by _refresh_all() every frame with pre-computed time and standard."""
+        if self._latest_ui_data is None or not getattr(self, "_ui_data_dirty", False):
+            return
+        self._ui_data_dirty = False
+            
+        data = self._latest_ui_data
         
-        # ── Aggiorna waveform stereo (numpy array, no list conversion) ───────
-        # Riordina il ring buffer per visualizzazione continua
-        idx = self._waveform_write_idx
-        waveform_l = np.roll(self._waveform_arr_l, -idx)
-        waveform_r = np.roll(self._waveform_arr_r, -idx)
-        self._curve_l.setData(waveform_l)
-        self._curve_r.setData(waveform_r)
+        # ── Waveform curves (L top, R bottom) ──
+        self._curve_l.setData(data["waveform_l"], skipFiniteCheck=True)
+        self._curve_r.setData(data["waveform_r"], skipFiniteCheck=True)
 
-        # ── Spectrum FFT (throttled: every 3 frames) ─────────────────────────
-        if self._frame_counter % 3 == 0 and self._lufs_filled >= 2048:
-            fft_size = 2048
-            # Calcola indice di partenza nel ring buffer
-            start_idx = (self._lufs_write_idx - fft_size) % self._lufs_buf_size
-            if start_idx + fft_size <= self._lufs_buf_size:
-                fft_data = self._lufs_buf[start_idx:start_idx + fft_size]
-            else:
-                # Wrap around
-                first_part = self._lufs_buf[start_idx:]
-                second_part = self._lufs_buf[:fft_size - len(first_part)]
-                fft_data = np.vstack([first_part, second_part])
-            
-            # Get cached FFT constants (window, log_freqs, bin_indices, x_axis)
-            window, _, bin_indices, x_axis = self._get_fft_cache(CONFIG.sample_rate, fft_size)
-            
-            left_ch = fft_data[:, 0].astype(np.float64) / 32768.0
-            right_ch = fft_data[:, 1].astype(np.float64) / 32768.0
-            
-            fft_l = np.abs(np.fft.rfft(left_ch * window))
-            fft_r = np.abs(np.fft.rfft(right_ch * window))
-            
-            # Converti in dB (con floor a -80 dB)
-            eps = 1e-10
-            db_l = np.clip(20 * np.log10(fft_l / fft_size + eps), -80, 0)
-            db_r = np.clip(20 * np.log10(fft_r / fft_size + eps), -80, 0)
-            
-            # Sample FFT at cached bin indices
-            self._spectrum_curve_l.setData(x_axis, db_l[bin_indices])
-            self._spectrum_curve_r.setData(x_axis, db_r[bin_indices])
+        # ── Spectrum Analyzer FFT curves ──
+        if data.get("fft_updated", True):
+            self._spectrum_curve_l.setData(data["x_axis"], data["spectrum_l"], skipFiniteCheck=True)
+            self._spectrum_curve_r.setData(data["x_axis"], data["spectrum_r"], skipFiniteCheck=True)
 
-        # ── LUFS/TP (throttled: every 500ms = ~10 updates/sec) ───────────────
-        if current_time - self._last_lufs_update >= 0.5 and self._lufs_filled >= CONFIG.sample_rate // 2:
-            self._last_lufs_update = current_time
-            if self._lufs_filled == self._lufs_buf_size:
-                arr = self._lufs_buf
-            else:
-                arr = self._lufs_buf[:self._lufs_filled]
-            self._lufs_value = compute_lufs(arr, CONFIG.sample_rate)
-            self._tp_l, self._tp_r = compute_true_peak_stereo(arr)
-
-        lufs = self._lufs_value
-        tp_l, tp_r = self._tp_l, self._tp_r
+        # ── LUFS & TP display ──
+        lufs = data["lufs"]
+        tp_l, tp_r = data["tp_l"], data["tp_r"]
         
-        metering_std = get_current_metering_standard()
-        
-        # LUFS display
+        # LUFS display values
         if lufs <= -60:
             txt, bar_val, color = "LUFS —.—", 0, TEXT_DIM
         else:
@@ -1567,11 +1838,21 @@ class StreamCard(QFrame):
             tp_r_s = f"{tp_r:+.0f}" if tp_r > -60 else "—"
             tp_txt = f"SPK L:{tp_l_s} R:{tp_r_s}"
 
-        self._lufs_label.setText(txt)
-        self._tp_label.setText(tp_txt)
-        self._lufs_bar.setValue(bar_val)
+        # Throttle updates: only write when value changes
+        lufs_changed = abs(lufs - self._last_lufs_display) >= 0.2
+        tp_changed   = (abs(tp_l - self._last_tp_l_display) >= 0.5 or
+                        abs(tp_r - self._last_tp_r_display) >= 0.5)
+
+        if lufs_changed:
+            self._last_lufs_display = lufs
+            self._lufs_label.setText(txt)
+            self._lufs_bar.setValue(bar_val)
+        if tp_changed:
+            self._last_tp_l_display = tp_l
+            self._last_tp_r_display = tp_r
+            self._tp_label.setText(tp_txt)
         
-        # ── Update stylesheet only when color changes ────────────────────────
+        # Update stylesheet only when color changes
         if color != self._last_lufs_color:
             self._last_lufs_color = color
             self._lufs_label.setStyleSheet(
@@ -1626,7 +1907,8 @@ class MainWindow(QMainWindow):
 
         self._timer = QTimer()
         self._timer.timeout.connect(self._refresh_all)
-        self._timer.start(66)
+        # Use CONFIG.refresh_ms (default 50ms = 20fps) — was hardcoded to 66ms
+        self._timer.start(CONFIG.refresh_ms)
 
         # ── Registrazione notifiche sessione Windows ──────────────────────
         # Rileva sblocco schermo/stand-by per forzare refresh waveform
@@ -1701,7 +1983,7 @@ class MainWindow(QMainWindow):
         left_col = QVBoxLayout()
         left_col.setSpacing(1)
 
-        title = QLabel("AudioStreamMETER v3.1")
+        title = QLabel("AudioStreamMETER v3.2")
         title.setStyleSheet(f"color: {ACCENT}; font-size: 16px; font-family: 'Courier New'; font-weight: bold; letter-spacing: 2px;")
 
         # Author attribution
@@ -2243,8 +2525,12 @@ class MainWindow(QMainWindow):
         self._add_btn.setEnabled(n < self.MAX_STREAMS)
 
     def _refresh_all(self):
+        # Compute time and metering standard ONCE per frame, shared across all cards
+        now = time.time()
+        std = get_current_metering_standard()
         for card in self._cards:
-            card.refresh_display()
+            if card.isVisible():
+                card.refresh_display(now, std)
 
     def _show_options(self):
         """Mostra il dialog delle opzioni."""

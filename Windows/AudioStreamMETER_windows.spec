@@ -12,7 +12,7 @@ a = Analysis(
     ],
     hiddenimports=[
         'PyQt6.QtCore', 'PyQt6.QtGui', 'PyQt6.QtWidgets',
-        'pyqtgraph', 'numpy', 'pyloudnorm'
+        'pyqtgraph', 'numpy', 'pyloudnorm', 'av', 'av.audio.resampler'
     ],
     hookspath=[],
     runtime_hooks=[],

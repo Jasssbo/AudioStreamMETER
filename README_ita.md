@@ -18,6 +18,17 @@ Visualizza fino a 16 flussi audio contemporaneamente con waveform e analizzatore
 
 ---
 
+## 🏛 Architettura e Performance
+
+Per monitorare fino a 16 stream stereo contemporaneamente in tempo reale senza causare blocchi dell'interfaccia grafica (GUI) o problemi di concorrenza del Global Interpreter Lock (GIL) di Python, AudioStreamMETER implementa un'architettura **disaccoppiata ispirata alle DAW professionali**:
+
+* **Thread DSP di Background (Audio Engine)**: Ogni stream card avvia un thread di background dedicato ([StreamWorker](file:///home/mintmzu/MyRepos/AudioStreamMETER/src/AudioStreamMETER.py#L407)). Questo worker legge il flusso PCM grezzo da FFmpeg, applica i filtri di ponderazione K in modo incrementale (filtri IIR biquad che mantengono lo stato `zi` tra i vari chunk), aggiorna i ring buffer e calcola la FFT.
+* **Limitazione del refresh UI (Rate Throttling)**: I thread di background disaccoppiano la frequenza di calcolo da quella di rendering della GUI. Invece di inviare segnali continui a PyQt per ogni pacchetto audio, limitano le notifiche UI a esattamente 20 aggiornamenti al secondo (50ms).
+* **GUI Thread a "Zero Calcoli"**: Il thread principale della GUI non esegue calcoli matematici, ridimensionamenti o FFT. Riceve semplicemente i dati visuali pre-calcolati e li disegna tramite curve veloci e accelerate.
+* **Misurazione conforme agli Standard**: Il valore LUFS viene calcolato come RMS ponderato K non filtrato (ungated) su un buffer scorrevole di 3 secondi, conforme alle specifiche EBU R128 e ITU-R BS.1770-4 per la loudness Short-term.
+
+---
+
 ## Struttura del progetto
 
 ```text
