@@ -37,7 +37,7 @@ Usage:
     Then add stream URLs from the GUI or write a CSV preset.
 """
 
-import sys, threading, subprocess, re, csv, json, time, math, atexit, platform, shutil, ctypes, webbrowser
+import sys, threading, subprocess, re, csv, json, time, math, atexit, platform, shutil, ctypes, webbrowser, argparse
 import scipy.signal as sig
 from pathlib import Path
 from collections import deque
@@ -1890,7 +1890,7 @@ class SessionNotificationFilter(QAbstractNativeEventFilter):
 class MainWindow(QMainWindow):
     MAX_STREAMS = 16
 
-    def __init__(self):
+    def __init__(self, preset_name: str | None = None):
         super().__init__()
         self.setWindowTitle("AudioStreamMETER")
         self.setMinimumSize(1100, 700)
@@ -1928,10 +1928,38 @@ class MainWindow(QMainWindow):
             except Exception:
                 pass  # Non critico: l'app funziona comunque
 
-        # Carica automaticamente default.csv se esiste
-        default = self._preset_dir / "default.csv"
-        if default.exists():
-            self._load_preset_file(default)
+        # Carica il preset se specificato da command line, altrimenti carica default.csv
+        loaded = False
+        if preset_name:
+            path = Path(preset_name)
+            if path.exists() and path.is_file():
+                self._load_preset_file(path, silent=True)
+                loaded = True
+            else:
+                possible_paths = [
+                    self._preset_dir / preset_name,
+                    self._preset_dir / f"{preset_name}.csv"
+                ]
+                for p in possible_paths:
+                    if p.exists() and p.is_file():
+                        self._load_preset_file(p, silent=True)
+                        loaded = True
+                        break
+                
+                if not loaded:
+                    for f in self._preset_files():
+                        if f.stem.lower() == preset_name.lower():
+                            self._load_preset_file(f, silent=True)
+                            loaded = True
+                            break
+
+            if not loaded:
+                print(f"Warning: Preset '{preset_name}' not found. Falling back to default preset.", file=sys.stderr)
+
+        if not loaded:
+            default = self._preset_dir / "default.csv"
+            if default.exists():
+                self._load_preset_file(default, silent=True)
 
     def _build_ui(self):
         self.setStyleSheet(f"""
@@ -2221,7 +2249,7 @@ class MainWindow(QMainWindow):
             return None
         return self._preset_combo.itemData(idx)
 
-    def _load_preset_file(self, path: Path, replace: bool = False):
+    def _load_preset_file(self, path: Path, replace: bool = False, silent: bool = False):
         """Legge un CSV nome,url,email e aggiunge gli stream (o sostituisce se replace=True)."""
         try:
             with open(path, newline="", encoding="utf-8") as f:
@@ -2234,7 +2262,10 @@ class MainWindow(QMainWindow):
                         email = r[2].strip() if len(r) >= 3 else ""
                         rows.append((name, url, email))
         except Exception as e:
-            QMessageBox.critical(self, "Preset read error", str(e))
+            if not silent:
+                QMessageBox.critical(self, "Preset read error", str(e))
+            else:
+                print(f"Preset read error for '{path}': {e}", file=sys.stderr)
             return
 
         if not rows:
@@ -2270,7 +2301,13 @@ class MainWindow(QMainWindow):
             self._relayout()
             self._update_count()
 
-        if skipped:
+        # Seleziona il preset nel combo
+        for i in range(self._preset_combo.count()):
+            if self._preset_combo.itemData(i) == path:
+                self._preset_combo.setCurrentIndex(i)
+                break
+
+        if skipped and not silent:
             QMessageBox.information(self, "Preset loaded",
                                     f"✓ {added} streams added, {skipped} skipped (duplicates or limit reached).")
 
@@ -2613,6 +2650,21 @@ def preboot_log():
 
 
 def main():
+    parser = argparse.ArgumentParser(description="AudioStreamMETER - Stream Audio Monitor")
+    parser.add_argument(
+        "-p", "--preset",
+        dest="preset",
+        help="Name of the preset (in customization/presets/, with or without .csv extension) or path to a CSV file to load on startup"
+    )
+    parser.add_argument(
+        "preset_pos",
+        nargs="?",
+        default=None,
+        help="Name of the preset or path to a CSV file (positional fallback)"
+    )
+    args, unknown = parser.parse_known_args()
+    preset_arg = args.preset or args.preset_pos
+
     app = QApplication(sys.argv)
     app.setApplicationName("AudioStreamMETER")
 
@@ -2627,7 +2679,7 @@ def main():
     palette.setColor(QPalette.ColorRole.Highlight, QColor(ACCENT2))
     app.setPalette(palette)
 
-    win = MainWindow()
+    win = MainWindow(preset_name=preset_arg)
     win.show()
     sys.exit(app.exec())
 
