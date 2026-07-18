@@ -1,4 +1,4 @@
-# AudioStreamMETER
+# LoudStream
 
 Real-time stereo audio monitor for HTTP streams (MP3/AAC), designed for Radio and WebRadio broadcasting.
 Monitor up to 16 audio streams simultaneously with real-time **waveform**, **L/R frequency spectrum**, **LUFS** and **Sample Peak** metering. Features include: audio playback (per-stream), configurable ffmpeg decoding settings, selectable metering standards (EBU R128, YouTube, Spotify, AES71...) and preset management via CSV files.
@@ -21,9 +21,9 @@ Monitor up to 16 audio streams simultaneously with real-time **waveform**, **L/R
 
 ## 🏛 Architecture & Performance
 
-To monitor up to 16 stereo streams simultaneously in real-time without GUI freezing or global interpreter lock (GIL) thread contention, AudioStreamMETER implements a professional **DAW-inspired decoupled architecture**:
+To monitor up to 16 stereo streams simultaneously in real-time without GUI freezing or global interpreter lock (GIL) thread contention, LoudStream implements a professional **DAW-inspired decoupled architecture**:
 
-* **DSP Worker Threads (Audio Engine)**: Every stream card spawns a dedicated background thread ([StreamWorker](file:///home/mintmzu/MyRepos/AudioStreamMETER/src/AudioStreamMETER.py#L407)). This worker reads raw PCM from FFmpeg, applies stateful K-weighting filters (biquad IIR filters carrying state vectors `zi` across chunks), updates raw and pre-filtered ring buffers, and runs short-term FFTs.
+* **DSP Worker Threads (Audio Engine)**: Every stream card spawns a dedicated background thread ([StreamWorker](file:///home/mintmzu/MyRepos/AudioStreamMETER/src/LoudStream.py#L407)). This worker reads raw PCM from FFmpeg, applies stateful K-weighting filters (biquad IIR filters carrying state vectors `zi` across chunks), updates raw and pre-filtered ring buffers, and runs short-term FFTs.
 * **UI Rate Throttling**: Background threads decouple their computation rate from the GUI rendering rate. Instead of flooding PyQt with signals on every packet, they throttle UI signal emissions to exactly 20 updates per second (50ms).
 * **Zero-Math GUI Thread**: The main thread does zero DSP math, windowing, or filtering. It simply takes the lightweight pre-computed visual payloads and draws them using fast, hardware-accelerated curves.
 * **Standard-Compliant Metering**: LUFS is computed as K-weighted ungated RMS over sliding 3-second buffers, fully compliant with EBU R128 and ITU-R BS.1770-4 Short-term loudness specifications.
@@ -33,15 +33,15 @@ To monitor up to 16 stereo streams simultaneously in real-time without GUI freez
 ## Project Structure
 
 ```text
-AudioStreamMETER/
+LoudStream/
 ├── src/
-│   ├── AudioStreamMETER.py     # Cross-platform version
+│   ├── LoudStream.py     # Cross-platform version
 │   ├── requirements.txt      # Python dependencies
 │   ├── metering_standards/standards.json   # Metering standards configuration
 │   └── presets/Default.csv   # Preset file for IP + Name sets with single-click recall
 ├── Windows/
-│   ├── AudioStreamMETER_windows.py   # Windows version
-│   ├── AudioStreamMETER_windows.spec # PyInstaller config
+│   ├── LoudStream_windows.py   # Windows version
+│   ├── LoudStream_windows.spec # PyInstaller config
 │   ├── installer.iss               # Inno Setup script
 │   ├── customization/
 │   │   ├── metering_standards/standards.json   # Metering standards configuration
@@ -59,10 +59,10 @@ AudioStreamMETER/
 
 ### Option 1: Windows 10/11 Installer
 
-The easiest way to install AudioStreamMETER on Windows.
+The easiest way to install LoudStream on Windows.
 
 1. Download the installer from Releases:
-[AudioStreamMETER_installer.exe](https://github.com/Jasssbo/AudioStreamMETER/releases/)
+[LoudStream_installer.exe](https://github.com/Jasssbo/LoudStream/releases/)
 
 2. Run the installer and follow the setup wizard
 
@@ -71,7 +71,7 @@ The easiest way to install AudioStreamMETER on Windows.
    - Desktop shortcut (optional)
    - Start Menu shortcut (optional)
    - Automatic uninstall via "uninstall.exe" in folder:
-   C:\Program Files (x86)\AudioStreamMETER
+   C:\Program Files (x86)\LoudStream
 
 > **Note**: The installer requires administrator privileges and Windows 10 or later (64-bit).
 
@@ -91,14 +91,14 @@ For those who prefer to compile the executable themselves.
 ##### 1. Clone or download the repository
 
 ```powershell or bash
-git clone https://github.com/Jasssbo/AudioStreamMETER.git
+git clone https://github.com/Jasssbo/LoudStream.git
 ```
 
 ##### 2. Create a virtual environment
 
 ```powershell or bash
 # Go in the repo directory with the terminal and Create the venv
-cd AudioStreamMETER && python -m venv .venv
+cd LoudStream && python -m venv .venv
 
 # Activate the venv
 .\.venv\Scripts\Activate.ps1   # on Windows PowerShell
@@ -163,13 +163,13 @@ Copy `ffmpeg.exe` and `ffplay.exe` to the ffmpeg_bin folder(inside the Windows f
 
 ```powershell or bash
 cd Windows
-pyinstaller AudioStreamMETER_windows.spec
+pyinstaller LoudStream_windows.spec
 ```
 
 The executable will be created in:
 
 ```text
-Windows/dist/AudioStreamMETER/AudioStreamMETER.exe
+Windows/dist/LoudStream/LoudStream.exe
 ```
 
 ---
@@ -184,7 +184,7 @@ If you want to create your own custom installer:
 
    ```text
    Windows/
-   ├── dist/AudioStreamMETER/    ← PyInstaller output
+   ├── dist/LoudStream/    ← PyInstaller output
    ├── ffmpeg_bin/            ← ffmpeg.exe and ffplay.exe
    └── installer.iss
    ```

@@ -1,11 +1,11 @@
-#define MyAppName "AudioStreamMETER"
+#define MyAppName "LoudStream"
 #define MyAppVersion "3.1.0"
 #define MyAppPublisher "Andrea Mazzurana"
-#define MyAppExeName "AudioStreamMETER.exe"
+#define MyAppExeName "LoudStream.exe"
 
 ; {#SourcePath} è automatico — Inno Setup lo risolve da solo
 ; basta che dist\ e ffmpeg_bin\ siano nella stessa cartella del .iss
-#define SourceApp SourcePath + "dist\AudioStreamMETER"
+#define SourceApp SourcePath + "dist\LoudStream"
 #define SourceFfmpeg SourcePath + "ffmpeg_bin"
 
 [Setup]
@@ -14,8 +14,8 @@ AppName={#MyAppName}
 AppVersion={#MyAppVersion}
 AppPublisher={#MyAppPublisher}
 AppPublisherURL=https://github.com/Jasssbo
-AppSupportURL=https://github.com/Jasssbo/AudioStreamMETER/issues
-AppUpdatesURL=https://github.com/Jasssbo/AudioStreamMETER/releases
+AppSupportURL=https://github.com/Jasssbo/LoudStream/issues
+AppUpdatesURL=https://github.com/Jasssbo/LoudStream/releases
 
 ; L'utente sceglie dove installare durante il wizard
 DefaultDirName={autopf}\{#MyAppName}
@@ -30,7 +30,7 @@ MinVersion=10.0
 
 ; Output nella cartella Output\ accanto al .iss — relativo e automatico
 OutputDir={#SourcePath}Output
-OutputBaseFilename=AudioStreamMETER_installer
+OutputBaseFilename=LoudStream_installer
 
 ; License agreement - user must accept before installing
 LicenseFile={#SourcePath}\LICENSE
@@ -38,7 +38,7 @@ LicenseFile={#SourcePath}\LICENSE
 Compression=lzma
 SolidCompression=no
 WizardStyle=modern
-AppMutex=AudioStreamMETERMutex
+AppMutex=LoudStreamMutex
 UninstallDisplaySize=150000000
 
 [Languages]

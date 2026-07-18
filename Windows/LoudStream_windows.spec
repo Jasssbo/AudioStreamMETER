@@ -1,8 +1,8 @@
-# AudioStreamMETER.spec
+# LoudStream.spec
 block_cipher = None
 
 a = Analysis(
-    ['AudioStreamMETER_windows.py'],
+    ['LoudStream_windows.py'],
     pathex=[],
     binaries=[],
     datas=[
@@ -27,7 +27,7 @@ pyz = PYZ(a.pure, a.zipped_data, cipher=block_cipher)
 exe = EXE(
     pyz, a.scripts, [],
     exclude_binaries=True,
-    name='AudioStreamMETER',
+    name='LoudStream',
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,
@@ -40,5 +40,5 @@ coll = COLLECT(
     exe, a.binaries, a.zipfiles, a.datas,
     strip=False,
     upx=False,
-    name='AudioStreamMETER'
+    name='LoudStream'
 )

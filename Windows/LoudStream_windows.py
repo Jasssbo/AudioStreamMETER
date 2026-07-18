@@ -1,5 +1,5 @@
 """
-AudioStreamMETER v3.2
+LoudStream v3.2
 MIT License
 Copyright (c) 2026 Andrea Mazzurana
 
@@ -23,8 +23,8 @@ SOFTWARE.
 
 ====================
 Monitor up to 16 stereo HTTP audio streams (MP3/AAC) in parallel.
-Displays real-time waveform, LUFS short-term (~3s), Sample Peak, and
-frequency spectrum (20Hz-20kHz) per stream.
+Displays real-time waveform, LUFS short-term (~3s), stereo phase
+correlation, and frequency spectrum (20Hz-20kHz) per stream.
 
 Dependencies:
     pip install PyQt6 pyqtgraph numpy pyloudnorm
@@ -33,11 +33,11 @@ System requirements:
     - ffmpeg installed and in PATH
 
 Usage:
-    python AudioStreamMETER.py
+    python LoudStream_windows.py
     Then add stream URLs from the GUI or write a CSV preset.
 """
 
-import sys, threading, subprocess, re, csv, json, time, math, atexit, platform, shutil, ctypes, webbrowser, argparse
+import sys, threading, subprocess, re, csv, json, time, math, atexit, platform, shutil, ctypes, webbrowser
 import scipy.signal as sig
 from pathlib import Path
 from collections import deque
@@ -64,7 +64,7 @@ IS_WINDOWS = platform.system() == "Windows"
 
 # ── Windows Job Object ──────────────────────────────────────────────────────
 # All ffmpeg/ffplay processes are assigned to this Job Object:
-#   - appear as children of AudioStreamMETER.exe in the process tree
+#   - appear as children of LoudStream.exe in the process tree
 #   - are killed automatically by the kernel if the parent app crashes
 _win_job = None
 
@@ -161,7 +161,7 @@ class StreamConfig:
         # ── ffmpeg parameters ──
         self.sample_rate      = 48000    # Hz: 22050 / 44100 / 48000
         self.chunk_samples    = 480      # samples per chunk (10ms @ 48kHz)
-        self.probesize        = 50000    # bytes: 16384–200000
+        self.probesize        = 150000   # bytes: 16384–200000 (150KB for reliable codec probing)
         self.analyzeduration  = 1000000  # µs: 500000–3000000
 
         # ── display parameters ──
@@ -169,7 +169,7 @@ class StreamConfig:
         self.waveform_smooth  = 4        # waveform decimation: 1=max detail, 16=very smooth
 
         # ── email template ──
-        self.email_subject    = "[AudioStreamMETER] Issue with stream: {stream_name}"
+        self.email_subject    = "[LoudStream] Issue with stream: {stream_name}"
         self.email_body       = "Stream URL: {stream_url}\nStream Name: {stream_name}\n\nIssue description:\n"
 
     @property
@@ -237,8 +237,8 @@ class MeteringStandard:
     lufs_target: float
     lufs_tolerance: float      # Green zone: target ± tolerance (typically 2)
     lufs_warning: float        # Yellow extends this much beyond green (typically 3, so ±5 total)
-    tp_max: float              # Maximum TP before RED (typically -1)
-    tp_warning: float          # Warning threshold for low TP (typically -4)
+    corr_warning: float        # Warning threshold for phase correlation (typically 0.3)
+    corr_critical: float       # Critical threshold for phase correlation (typically 0.0)
     description: str
     
     def get_lufs_color(self, lufs: float) -> str:
@@ -255,18 +255,13 @@ class MeteringStandard:
             return YELLOW
         return RED
     
-    def get_tp_color(self, tp: float) -> str:
-        if tp <= -60: 
-            return TEXT_DIM
-        if tp > self.tp_max:
-            return RED      # Above maximum - clipping danger
-        if tp >= self.tp_warning:
-            return GREEN    # In the acceptable range (between tp_max and tp_warning)
-        green_range = self.tp_max - self.tp_warning 
-        yellow_floor = self.tp_warning - green_range  
-        if tp >= yellow_floor:
-            return YELLOW   # Below warning threshold (getting too quiet)
-        return RED          # Way too quiet (below double the acceptable range)
+    def get_corr_color(self, corr: float) -> str:
+        """Color for stereo phase correlation: Green=healthy, Yellow=warning, Red=problem."""
+        if corr >= self.corr_warning:
+            return GREEN    # Healthy stereo or mono
+        if corr >= self.corr_critical:
+            return YELLOW   # Low correlation — warning
+        return RED          # Out of phase — critical
 
 
 
@@ -297,8 +292,8 @@ def _load_metering_standards() -> Dict[str, MeteringStandard]:
                 lufs_target=values["lufs_target"],
                 lufs_tolerance=values.get("lufs_tolerance", 2.0),  # Default: ±2 LUFS for green
                 lufs_warning=values.get("lufs_warning", 3.0),      # Default: additional ±3 for yellow
-                tp_max=values.get("tp_max", -1.0),
-                tp_warning=values.get("tp_warning", -2.0),
+                corr_warning=values.get("corr_warning", 0.3),
+                corr_critical=values.get("corr_critical", 0.0),
                 description=values["description"]
             )
     except Exception as e:
@@ -306,7 +301,7 @@ def _load_metering_standards() -> Dict[str, MeteringStandard]:
         # Minimal fallback if file doesn't exist
         standards["EBU R128"] = MeteringStandard(
             name="EBU R128", lufs_target=-23.0, lufs_tolerance=2.0,
-            lufs_warning=3.0, tp_max=-1.0, tp_warning=-2.0,
+            lufs_warning=3.0, corr_warning=0.3, corr_critical=0.0,
             description="European broadcast standard"
         )
     return standards
@@ -419,13 +414,16 @@ class StreamWorker(QObject):
         self._display_l = np.empty(WAVEFORM_HISTORY, dtype=np.float32)
         self._display_r = np.empty(WAVEFORM_HISTORY, dtype=np.float32)
         
-        # Incremental LUFS & Peak deques
+        # Incremental LUFS deque (maxlen safety net for long-running stability)
         self._lufs_window_frames = 3 * self.sample_rate
-        self._lufs_deque = deque()
+        self._lufs_deque = deque(maxlen=200)
         self._lufs_deque_frames = 0
         
-        self._peaks_deque = deque()
-        self._peaks_deque_frames = 0
+        # Stereo phase correlation (exponential moving average, ~1s time constant)
+        self._latest_corr = 0.0
+        
+        # Retry counter for transient error suppression
+        self._retry_count = 0
         
         # Small raw buffer (4096 frames) just for FFT calculations
         self._raw_buf_size = 4096
@@ -435,8 +433,6 @@ class StreamWorker(QObject):
         
         # UI cached states
         self._latest_lufs = -70.0
-        self._latest_tp_l = -70.0
-        self._latest_tp_r = -70.0
         self._latest_spec_l = np.zeros(256, dtype=np.float32) - 80.0
         self._latest_spec_r = np.zeros(256, dtype=np.float32) - 80.0
         
@@ -508,7 +504,7 @@ class StreamWorker(QObject):
         else:
             filtered_chunk = stereo.astype(np.float32)
             
-        # 3. Update Moving Window Deques for LUFS and Peak
+        # 3. Update Moving Window Deque for LUFS
         sum_sq_l = float(np.dot(filtered_chunk[:, 0], filtered_chunk[:, 0]))
         sum_sq_r = float(np.dot(filtered_chunk[:, 1], filtered_chunk[:, 1]))
         self._lufs_deque.append((sum_sq_l, sum_sq_r, n_frames))
@@ -518,14 +514,17 @@ class StreamWorker(QObject):
             popped = self._lufs_deque.popleft()
             self._lufs_deque_frames -= popped[2]
             
-        peak_l = float(np.max(np.abs(stereo[:, 0])))
-        peak_r = float(np.max(np.abs(stereo[:, 1])))
-        self._peaks_deque.append((peak_l, peak_r, n_frames))
-        self._peaks_deque_frames += n_frames
-        
-        while self._peaks_deque_frames - self._peaks_deque[0][2] >= self._lufs_window_frames:
-            popped = self._peaks_deque.popleft()
-            self._peaks_deque_frames -= popped[2]
+        # 4. Stereo Phase Correlation (EMA, ~1s time constant)
+        chunk_l = stereo[:, 0].astype(np.float32)
+        chunk_r = stereo[:, 1].astype(np.float32)
+        dot_lr = float(np.dot(chunk_l, chunk_r))
+        dot_ll = float(np.dot(chunk_l, chunk_l))
+        dot_rr = float(np.dot(chunk_r, chunk_r))
+        denom = math.sqrt(dot_ll * dot_rr)
+        inst_corr = dot_lr / denom if denom > 0 else 0.0
+        # Exponential moving average: alpha = chunk_duration / 1.0s
+        alpha = min(n_frames / self.sample_rate, 1.0)
+        self._latest_corr = (1.0 - alpha) * self._latest_corr + alpha * inst_corr
             
         # Calculate symmetric min/max peak envelopes over small blocks (independent of chunk size)
         block_size = max(8, self.waveform_smooth * 16)
@@ -622,17 +621,7 @@ class StreamWorker(QObject):
             else:
                 self._latest_lufs = -70.0
                 
-            # Scan absolute maximum peaks in deque
-            max_peak_l = 0.0
-            max_peak_r = 0.0
-            for item in self._peaks_deque:
-                if item[0] > max_peak_l: max_peak_l = item[0]
-                if item[1] > max_peak_r: max_peak_r = item[1]
-                
-            tp_l = 20.0 * math.log10(max_peak_l / 32768.0) if max_peak_l >= 1 else -70.0
-            tp_r = 20.0 * math.log10(max_peak_r / 32768.0) if max_peak_r >= 1 else -70.0
-            self._latest_tp_l = tp_l
-            self._latest_tp_r = tp_r
+
             
         # 7. GUI Throttled emit (20 FPS = 50ms)
         refresh_interval = CONFIG.refresh_ms * 0.001
@@ -655,8 +644,7 @@ class StreamWorker(QObject):
                 "spectrum_r": self._latest_spec_r.copy(),
                 "x_axis": x_axis.copy(),
                 "lufs": self._latest_lufs,
-                "tp_l": self._latest_tp_l,
-                "tp_r": self._latest_tp_r,
+                "corr": self._latest_corr,
                 "fft_updated": self._fft_updated
             }
             self._fft_updated = False
@@ -666,6 +654,18 @@ class StreamWorker(QObject):
         while self._alive and not self._stop_event.is_set():
             self._safe_emit(self.status_signal, "connecting")
             container = None
+            
+            # Reset all DSP state for clean reconnection
+            self._lufs_deque.clear()
+            self._lufs_deque_frames = 0
+            self._latest_corr = 0.0
+            self._waveform_arr_l[:] = 0
+            self._waveform_arr_r[:] = 0
+            self._waveform_write_idx = 0
+            self._raw_buf[:] = 0
+            self._raw_write_idx = 0
+            self._raw_filled = 0
+            self._latest_lufs = -70.0
             try:
                 # Open the audio stream in-process with timeout and auto-reconnect configuration
                 container = av.open(self.url, options={
@@ -715,6 +715,7 @@ class StreamWorker(QObject):
                 )
                 
                 self._safe_emit(self.status_signal, "live")
+                self._retry_count = 0  # Reset retry counter on successful connection
                 
                 accumulated_samples = []
                 accumulated_size = 0
@@ -758,7 +759,9 @@ class StreamWorker(QObject):
                         self._process_chunk(chunk)
                         
             except Exception as e:
-                if self._alive:
+                self._retry_count += 1
+                if self._alive and self._retry_count > 2:
+                    # Only show error in UI after 2+ consecutive failures
                     self._safe_emit(self.error_signal, str(e))
             finally:
                 if container:
@@ -766,6 +769,7 @@ class StreamWorker(QObject):
                         container.close()
                     except Exception:
                         pass
+                    container = None  # Release reference for GC safety
                         
             # If the connection drops, wait 30 seconds before attempting reconnect
             if self._alive and not self._stop_event.is_set():
@@ -1341,7 +1345,7 @@ class OptionsDialog(QDialog):
             self._std_desc.setText(std.description)
             self._std_values.setText(
                 f"Target: {std.lufs_target:+.0f} LUFS (±{std.lufs_tolerance:.0f} dB)  |  "
-                f"SPK max: {std.tp_max:+.0f} dBFS"
+                f"Φ warning: < {std.corr_warning:.1f}"
             )
         else:
             self._std_desc.setText("")
@@ -1358,7 +1362,7 @@ class OptionsDialog(QDialog):
         idx = list(METERING_STANDARDS.keys()).index("EBU R128")
         self._metering_combo.setCurrentIndex(idx)
         # Reset email template
-        self._email_subject.setText("[AudioStreamMETER] Issue with stream: {stream_name}")
+        self._email_subject.setText("[LoudStream] Issue with stream: {stream_name}")
         self._email_body.setPlainText("Stream URL: {stream_url}\nStream Name: {stream_name}\n\nIssue description:\n")
 
     def _apply(self):
@@ -1384,7 +1388,7 @@ class StreamCard(QFrame):
     remove_requested = pyqtSignal(object)
     listen_requested = pyqtSignal(object)   # emesso quando si vuole ascoltare
 
-    def __init__(self, url: str, index: int, parent=None, email: str = ""):
+    def __init__(self, url: str, index: int, parent=None, email: str = "", stagger_delay_ms: int = 0):
         super().__init__(parent)
         self.url = url
         self.index = index
@@ -1399,13 +1403,16 @@ class StreamCard(QFrame):
         
         # ── Performance: color cache & display values (throttled updates) ──
         self._last_lufs_color  = None      # cached LUFS color (avoid setStyleSheet)
-        self._last_tp_color    = None      # cached TP color
+        self._last_corr_color  = None      # cached Correlation color
         self._last_lufs_display = -999.0   # last displayed LUFS value (for text throttle)
-        self._last_tp_l_display = -999.0   # last displayed TP left
-        self._last_tp_r_display = -999.0   # last displayed TP right
+        self._last_corr_display = -999.0   # last displayed correlation value
 
         self._build_ui()
-        self._start_stream()
+        # Stagger stream startup to reduce network contention when loading many streams
+        if stagger_delay_ms > 0:
+            QTimer.singleShot(stagger_delay_ms, self._start_stream)
+        else:
+            self._start_stream()
 
     # ── UI ────────────────────────────────────────────────────────────────────
     def _build_ui(self):
@@ -1611,10 +1618,10 @@ class StreamCard(QFrame):
         self._lufs_label.setStyleSheet(
             f"color: {ACCENT}; font-size: 10px; font-family: 'Courier New'; font-weight: bold;")
 
-        self._tp_label = QLabel("SPK L:— R:—")
-        self._tp_label.setStyleSheet(
+        self._corr_label = QLabel("Φ ——")
+        self._corr_label.setStyleSheet(
             f"color: {TEXT_DIM}; font-size: 10px; font-family: 'Courier New'; font-weight: bold;")
-        self._tp_label.setToolTip("Sample Peak (dBFS) — L=Left R=Right\nNote: sample-domain peak, not inter-sample True Peak")
+        self._corr_label.setToolTip("Stereo Correlation Index\nRange: -1.0 to +1.0\n+1 = Mono, +0.5 = Stereo, 0 = Unrelated, -1 = Out of phase")
 
         self._lufs_bar = QProgressBar()
         self._lufs_bar.setRange(0, 100)
@@ -1636,7 +1643,7 @@ class StreamCard(QFrame):
 
         meter_row.addWidget(self._lufs_label)
         meter_row.addWidget(self._lufs_bar, 1)
-        meter_row.addWidget(self._tp_label)
+        meter_row.addWidget(self._corr_label)
         root.addLayout(meter_row)
 
     # ── Helpers ───────────────────────────────────────────────────────────────
@@ -1756,31 +1763,30 @@ class StreamCard(QFrame):
         colors = {"connecting": YELLOW, "live": GREEN, "stopped": RED}
         self._status_dot.setStyleSheet(f"color: {colors.get(status, GRAY2)};")
         
-        # Restore name text & default style when connecting/live if it previously showed an error
+        # Unconditionally restore name text & style when connecting/live
+        # (fixes race condition where error_signal fires after status_signal)
         if status in ("connecting", "live"):
-            current_text = self._name_edit.text()
-            if current_text.startswith("⚠"):
-                self._name_edit.setText(self._custom_name or self._short_url())
-                self._name_edit.setStyleSheet(f"""
-                    QLineEdit {{
-                        background: transparent;
-                        color: {TEXT};
-                        border: none;
-                        border-bottom: 1px solid transparent;
-                        font-size: 12px;
-                        font-family: 'Courier New';
-                        font-weight: bold;
-                        padding: 2px 4px;
-                    }}
-                    QLineEdit:hover {{
-                        border-bottom: 1px solid {GRAY2};
-                    }}
-                    QLineEdit:focus {{
-                        background: {BG_CARD2};
-                        border: 1px solid {ACCENT};
-                        border-radius: 3px;
-                    }}
-                """)
+            self._name_edit.setText(self._custom_name or self._short_url())
+            self._name_edit.setStyleSheet(f"""
+                QLineEdit {{
+                    background: transparent;
+                    color: {TEXT};
+                    border: none;
+                    border-bottom: 1px solid transparent;
+                    font-size: 12px;
+                    font-family: 'Courier New';
+                    font-weight: bold;
+                    padding: 2px 4px;
+                }}
+                QLineEdit:hover {{
+                    border-bottom: 1px solid {GRAY2};
+                }}
+                QLineEdit:focus {{
+                    background: {BG_CARD2};
+                    border: 1px solid {ACCENT};
+                    border-radius: 3px;
+                }}
+            """)
                 
         if status in ("connecting", "stopped"):
             # Clear UI curves and reset labels once to avoid CPU rendering on stale data
@@ -1789,7 +1795,7 @@ class StreamCard(QFrame):
             self._spectrum_curve_l.setData([], skipFiniteCheck=True)
             self._spectrum_curve_r.setData([], skipFiniteCheck=True)
             self._lufs_label.setText("LUFS —.—")
-            self._tp_label.setText("SPK L:— R:—")
+            self._corr_label.setText("Φ ——")
             self._lufs_bar.setValue(0)
             self._latest_ui_data = None
             self._ui_data_dirty = False
@@ -1815,9 +1821,9 @@ class StreamCard(QFrame):
             self._spectrum_curve_l.setData(data["x_axis"], data["spectrum_l"], skipFiniteCheck=True)
             self._spectrum_curve_r.setData(data["x_axis"], data["spectrum_r"], skipFiniteCheck=True)
 
-        # ── LUFS & TP display ──
+        # ── LUFS & Correlation display ──
         lufs = data["lufs"]
-        tp_l, tp_r = data["tp_l"], data["tp_r"]
+        corr = data.get("corr", 0.0)
         
         # LUFS display values
         if lufs <= -60:
@@ -1827,40 +1833,35 @@ class StreamCard(QFrame):
             bar_val = int(max(0, min(100, (lufs + 60) / 54 * 100)))
             color = metering_std.get_lufs_color(lufs)
 
-        # Sample Peak stereo display
-        tp_max = max(tp_l, tp_r)
-        tp_color = metering_std.get_tp_color(tp_max)
-        if tp_l <= -60 and tp_r <= -60:
-            tp_txt = "SPK L:— R:—"
-            tp_color = TEXT_DIM
+        # Correlation display
+        corr_color = metering_std.get_corr_color(corr)
+        if lufs <= -60:
+            corr_txt = "Φ ——"
+            corr_color = TEXT_DIM
         else:
-            tp_l_s = f"{tp_l:+.0f}" if tp_l > -60 else "—"
-            tp_r_s = f"{tp_r:+.0f}" if tp_r > -60 else "—"
-            tp_txt = f"SPK L:{tp_l_s} R:{tp_r_s}"
+            corr_txt = f"Φ {corr:+.2f}"
 
         # Throttle updates: only write when value changes
         lufs_changed = abs(lufs - self._last_lufs_display) >= 0.2
-        tp_changed   = (abs(tp_l - self._last_tp_l_display) >= 0.5 or
-                        abs(tp_r - self._last_tp_r_display) >= 0.5)
+        corr_changed = abs(corr - self._last_corr_display) >= 0.05 or (lufs <= -60 and self._last_corr_display != -999.0)
 
         if lufs_changed:
             self._last_lufs_display = lufs
             self._lufs_label.setText(txt)
             self._lufs_bar.setValue(bar_val)
-        if tp_changed:
-            self._last_tp_l_display = tp_l
-            self._last_tp_r_display = tp_r
-            self._tp_label.setText(tp_txt)
+        if corr_changed:
+            self._last_corr_display = corr if lufs > -60 else -999.0
+            self._corr_label.setText(corr_txt)
         
         # Update stylesheet only when color changes
         if color != self._last_lufs_color:
             self._last_lufs_color = color
             self._lufs_label.setStyleSheet(
                 f"color: {color}; font-size: 10px; font-family: 'Courier New'; font-weight: bold;")
-        if tp_color != self._last_tp_color:
-            self._last_tp_color = tp_color
-            self._tp_label.setStyleSheet(
-                f"color: {tp_color}; font-size: 10px; font-family: 'Courier New'; font-weight: bold;")
+        if corr_color != self._last_corr_color:
+            self._last_corr_color = corr_color
+            self._corr_label.setStyleSheet(
+                f"color: {corr_color}; font-size: 10px; font-family: 'Courier New'; font-weight: bold;")
 
 
 # ── Filtro eventi Windows per rilevare sblocco sessione ───────────────────────
@@ -1890,9 +1891,9 @@ class SessionNotificationFilter(QAbstractNativeEventFilter):
 class MainWindow(QMainWindow):
     MAX_STREAMS = 16
 
-    def __init__(self, preset_name: str | None = None):
+    def __init__(self):
         super().__init__()
-        self.setWindowTitle("AudioStreamMETER")
+        self.setWindowTitle("LoudStream")
         self.setMinimumSize(1100, 700)
         self._cards: list[StreamCard] = []
         self._active_player: AudioPlayer | None = None
@@ -1928,38 +1929,10 @@ class MainWindow(QMainWindow):
             except Exception:
                 pass  # Non critico: l'app funziona comunque
 
-        # Carica il preset se specificato da command line, altrimenti carica default.csv
-        loaded = False
-        if preset_name:
-            path = Path(preset_name)
-            if path.exists() and path.is_file():
-                self._load_preset_file(path, silent=True)
-                loaded = True
-            else:
-                possible_paths = [
-                    self._preset_dir / preset_name,
-                    self._preset_dir / f"{preset_name}.csv"
-                ]
-                for p in possible_paths:
-                    if p.exists() and p.is_file():
-                        self._load_preset_file(p, silent=True)
-                        loaded = True
-                        break
-                
-                if not loaded:
-                    for f in self._preset_files():
-                        if f.stem.lower() == preset_name.lower():
-                            self._load_preset_file(f, silent=True)
-                            loaded = True
-                            break
-
-            if not loaded:
-                print(f"Warning: Preset '{preset_name}' not found. Falling back to default preset.", file=sys.stderr)
-
-        if not loaded:
-            default = self._preset_dir / "default.csv"
-            if default.exists():
-                self._load_preset_file(default, silent=True)
+        # Carica automaticamente default.csv se esiste
+        default = self._preset_dir / "default.csv"
+        if default.exists():
+            self._load_preset_file(default)
 
     def _build_ui(self):
         self.setStyleSheet(f"""
@@ -2011,7 +1984,7 @@ class MainWindow(QMainWindow):
         left_col = QVBoxLayout()
         left_col.setSpacing(1)
 
-        title = QLabel("AudioStreamMETER v3.2")
+        title = QLabel("LoudStream v3.2")
         title.setStyleSheet(f"color: {ACCENT}; font-size: 16px; font-family: 'Courier New'; font-weight: bold; letter-spacing: 2px;")
 
         # Author attribution
@@ -2024,7 +1997,7 @@ class MainWindow(QMainWindow):
         self._metering_std_label.setToolTip(
             f"Active Metering Standard: {std.name}\n"
             f"Target LUFS: {std.lufs_target:+.0f} (±{std.lufs_tolerance:.0f} dB)\n"
-            f"Sample Peak max: {std.tp_max:+.0f} dBFS\n\n"
+            f"Phase warning: < {std.corr_warning:.1f}\n\n"
             "Change in ⚙ Options"
         )
         self._metering_std_label.setStyleSheet(f"color: {ACCENT}; font-size: 14px; font-family: 'Courier New';")
@@ -2249,7 +2222,7 @@ class MainWindow(QMainWindow):
             return None
         return self._preset_combo.itemData(idx)
 
-    def _load_preset_file(self, path: Path, replace: bool = False, silent: bool = False):
+    def _load_preset_file(self, path: Path, replace: bool = False):
         """Legge un CSV nome,url,email e aggiunge gli stream (o sostituisce se replace=True)."""
         try:
             with open(path, newline="", encoding="utf-8") as f:
@@ -2262,10 +2235,7 @@ class MainWindow(QMainWindow):
                         email = r[2].strip() if len(r) >= 3 else ""
                         rows.append((name, url, email))
         except Exception as e:
-            if not silent:
-                QMessageBox.critical(self, "Preset read error", str(e))
-            else:
-                print(f"Preset read error for '{path}': {e}", file=sys.stderr)
+            QMessageBox.critical(self, "Preset read error", str(e))
             return
 
         if not rows:
@@ -2285,7 +2255,8 @@ class MainWindow(QMainWindow):
                 skipped += 1
                 continue
             idx = len(self._cards)
-            card = StreamCard(url, idx, self._grid_container, email=email)
+            card = StreamCard(url, idx, self._grid_container, email=email,
+                             stagger_delay_ms=added * 250)
             card.remove_requested.connect(self._remove_card)
             card.listen_requested.connect(self._on_listen_requested)
             # Imposta nome custom se specificato nel CSV
@@ -2301,13 +2272,7 @@ class MainWindow(QMainWindow):
             self._relayout()
             self._update_count()
 
-        # Seleziona il preset nel combo
-        for i in range(self._preset_combo.count()):
-            if self._preset_combo.itemData(i) == path:
-                self._preset_combo.setCurrentIndex(i)
-                break
-
-        if skipped and not silent:
+        if skipped:
             QMessageBox.information(self, "Preset loaded",
                                     f"✓ {added} streams added, {skipped} skipped (duplicates or limit reached).")
 
@@ -2436,7 +2401,8 @@ class MainWindow(QMainWindow):
                 continue
 
             idx = len(self._cards)
-            card = StreamCard(url, idx, self._grid_container)
+            card = StreamCard(url, idx, self._grid_container,
+                             stagger_delay_ms=added * 250)
             card.remove_requested.connect(self._remove_card)
             card.listen_requested.connect(self._on_listen_requested)
             self._cards.append(card)
@@ -2585,7 +2551,7 @@ class MainWindow(QMainWindow):
         self._metering_std_label.setToolTip(
             f"Active Metering Standard: {metering_std.name}\n"
             f"Target LUFS: {metering_std.lufs_target:+.0f} (±{metering_std.lufs_tolerance:.0f} dB)\n"
-            f"Sample Peak max: {metering_std.tp_max:+.0f} dBFS\n"
+            f"Phase warning: < {metering_std.corr_warning:.1f}\n"
             "Change in ⚙ Options"
         )
         
@@ -2599,7 +2565,7 @@ class MainWindow(QMainWindow):
             f"Smooth: {CONFIG.waveform_smooth}×\n\n"
             f"Standard Metering: {metering_std.name}\n"
             f"Target LUFS: {metering_std.lufs_target:+.0f}  |  "
-            f"SPK max: {metering_std.tp_max:+.0f} dBFS\n\n"
+            f"Φ warning: < {metering_std.corr_warning:.1f}\n\n"
             f"New settings apply immediately."
         )
 
@@ -2650,23 +2616,8 @@ def preboot_log():
 
 
 def main():
-    parser = argparse.ArgumentParser(description="AudioStreamMETER - Stream Audio Monitor")
-    parser.add_argument(
-        "-p", "--preset",
-        dest="preset",
-        help="Name of the preset (in customization/presets/, with or without .csv extension) or path to a CSV file to load on startup"
-    )
-    parser.add_argument(
-        "preset_pos",
-        nargs="?",
-        default=None,
-        help="Name of the preset or path to a CSV file (positional fallback)"
-    )
-    args, unknown = parser.parse_known_args()
-    preset_arg = args.preset or args.preset_pos
-
     app = QApplication(sys.argv)
-    app.setApplicationName("AudioStreamMETER")
+    app.setApplicationName("LoudStream")
 
     # Dark palette globale
     palette = QPalette()
@@ -2679,7 +2630,7 @@ def main():
     palette.setColor(QPalette.ColorRole.Highlight, QColor(ACCENT2))
     app.setPalette(palette)
 
-    win = MainWindow(preset_name=preset_arg)
+    win = MainWindow()
     win.show()
     sys.exit(app.exec())
 
