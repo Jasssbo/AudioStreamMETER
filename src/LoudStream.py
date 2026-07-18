@@ -1,5 +1,5 @@
 """
-LoudStream v3.2
+LoudStream v4.0
 MIT License
 Copyright (c) 2026 Andrea Mazzurana
 

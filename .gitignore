@@ -412,3 +412,4 @@ FodyWeavers.xsd
 
 # JetBrains Rider
 *.sln.iml
+IA docs/professional_analysis.md

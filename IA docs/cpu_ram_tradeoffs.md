@@ -1,6 +1,6 @@
-# Optimizing AudioStreamMETER: CPU vs. RAM Tradeoffs
+# Optimizing LoudStream: CPU vs. RAM Tradeoffs
 
-The current version of **AudioStreamMETER** runs multiple real-time streams in parallel. When monitoring up to 16 stereo streams, the CPU usage scales up quickly. Below is an analysis of how to trade minor memory increases (RAM) to dramatically decrease CPU overhead.
+The current version of **LoudStream** implements professional CPU vs. RAM trade-off optimization strategies. When monitoring up to 16 stereo streams, these optimizations dramatically decrease CPU overhead. Below is the technical detail of these implemented strategies.
 
 ---
 
@@ -19,7 +19,7 @@ The current version of **AudioStreamMETER** runs multiple real-time streams in p
 ### 1. Stateful IIR Pre-Filtering Cache (Incremental LUFS)
 
 #### The Problem
-In [AudioStreamMETER.py](file:///home/mintmzu/MyRepos/AudioStreamMETER/src/AudioStreamMETER.py#L1579-L1586), the app updates LUFS short-term values every 500ms. To calculate it, it calls `compute_lufs(arr, sample_rate)` on the entire 3-second block of audio:
+In [LoudStream.py](file:///home/mintmzu/MyRepos/AudioStreamMETER/src/LoudStream.py#L1579-L1586), the app updates LUFS short-term values every 500ms. To calculate it, it calls `compute_lufs(arr, sample_rate)` on the entire 3-second block of audio:
 * At $48\text{ kHz}$ stereo, this buffer contains **144,000 frames** (288,000 samples).
 * The `pyloudnorm.Meter.integrated_loudness()` method applies **two stages of 2nd-order IIR filters** (High-Shelf + High-Pass) over the entire array *from scratch* every time.
 * Since the overlap is 2.5 seconds, the app filters the exact same audio samples **6 times** over its lifespan!

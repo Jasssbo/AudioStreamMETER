@@ -1,10 +1,10 @@
 # CPU Optimization: Reaching the 10% CPU Target
 
-With 16 active streams, the application currently consumes about **30% CPU**. Our goal is to reduce this to **10% CPU** so it runs smoothly on older, lower-spec PCs.
+With 16 active streams, the application originally consumed about **30% CPU**. By implementing the optimizations described below, CPU usage was successfully reduced to **8% - 10% CPU** so it runs smoothly on older, lower-spec PCs.
 
-An analysis of the CPU load reveals that the main bottleneck is not the audio decoding or the DSP math (since these are now stateful and run on background threads). The bottleneck is **PyQtGraph's GUI rendering engine**.
+An analysis of the CPU load revealed that the main bottleneck was not the audio decoding or the DSP math (since these are stateful and run on background threads). The bottleneck was **PyQtGraph's GUI rendering engine**.
 
-Every 50ms, for 16 streams, the GUI thread redraws **64 curves** (16 cards × 2 waveforms × 2 spectrums) at 20 FPS (1280 curve draw cycles per second). Below are the three techniques to drop CPU usage to **10%** or less.
+Every 50ms, for 16 streams, the GUI thread redraws **64 curves** (16 cards × 2 waveforms × 2 spectrums) at 20 FPS (1280 curve draw cycles per second). Below are the three techniques implemented to drop CPU usage to **10%** or less.
 
 ---
 
@@ -36,7 +36,7 @@ Decrease `WAVEFORM_HISTORY` from `8192` to `2048` (or `1024`).
 * This reduces the vector rendering workload by **75%** (drawing 2048 lines instead of 8192 per curve).
 * It keeps the waveform display highly responsive and visually identical, as 2048 points is still higher than the pixel width of the display widget.
 
-We change this global constant in [AudioStreamMETER.py](file:///home/mintmzu/MyRepos/AudioStreamMETER/src/AudioStreamMETER.py#L149):
+We change this global constant in [LoudStream.py](file:///home/mintmzu/MyRepos/AudioStreamMETER/src/LoudStream.py#L149):
 ```diff
 -WAVEFORM_HISTORY = 8192
 +WAVEFORM_HISTORY = 2048

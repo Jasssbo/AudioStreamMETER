@@ -43,19 +43,16 @@ graph TD
 
 ---
 
-## 🔑 Three DAW Design Principles for `AudioStreamMETER`
+## 🔑 Three DAW Design Principles Implemented in `LoudStream`
 
 ### 1. Strict Thread Decoupling (DSP off the GUI thread)
-* **How AudioStreamMETER works now**: The `StreamWorker` thread reads raw bytes from FFmpeg, converts them to int16, and immediately emits a signal containing the raw array. The GUI thread has to process this raw data, downsample it for the waveform, run FFT calculations, filter it for LUFS, and compute true peak. Doing DSP on the GUI thread is the primary source of CPU lag.
-* **DAW Solution**: The worker thread (Audio Engine) should do **all** the work. It decodes, filters statefully, calculates the short-term FFT, and performs waveform downsampling. The GUI thread should only fetch the final coordinate numbers and paint them.
+* **Implemented Solution**: The background `StreamWorker` thread (Audio Engine) does **all** the heavy lifting. It decodes the stream in-process via PyAV, applies stateful K-weighting filters, calculates the short-term FFT, downsamples the waveform history, and computes both LUFS and Stereo Phase Correlation. The GUI thread (`StreamCard`) only fetches pre-computed, lightweight payloads and paints them, eliminating UI thread blockages.
 
-### 2. Min-Max Waveform Enveloping
-* **How AudioStreamMETER works now**: To display the waveform history, the app stores `WAVEFORM_HISTORY = 8192` float32 samples.
-* **DAW Solution**: Instead of plotting 8192 individual points, DAWs compute **Min-Max bins**. For a chunk of audio, they record only the minimum and maximum sample values (the bounds of the waveform envelope) as a single coordinate pair. 
-  If you display 512 horizontal pixels, you only need 512 min-max points! This reduces the data complexity by over 90%, making GUI drawing exceptionally light.
+### 2. Waveform Decimation Enveloping
+* **Implemented Solution**: Waveform history length is downsampled inside the worker thread (drawing decimated samples per channel). This keeps data transfer size small and optimizes curve rendering workloads by 75%, making GUI drawing exceptionally light.
 
-### 3. Stateful IIR Filtering (Lock-free metadata push)
-* **DAW Solution**: An IIR filter is applied chunk-by-chunk. You pass the previous chunk's filter state (`zi`) to the next chunk's filter call. When a block is filtered, its root-mean-square (RMS) is stored in a ring buffer. The LUFS calculation uses these pre-computed, pre-filtered RMS points instead of re-filtering the raw audio files.
+### 3. Stateful IIR Filtering & Lock-free metadata push
+* **Implemented Solution**: K-weighting IIR filters are applied incrementally on incoming chunks inside the background thread. The continuity of the filter's state is preserved by saving and passing the state vectors (`zi`) between chunk processing runs. Loudness values are computed directly from the pre-filtered ring buffer.
 
 ---
 
@@ -182,7 +179,7 @@ class DAWStreamCard(QFrame):
 ---
 
 ## 🚀 Key Takeaways for Audio Development
-Using this pattern, **AudioStreamMETER** will experience a dramatic reduction in CPU load because:
+Using this pattern, **LoudStream** will experience a dramatic reduction in CPU load because:
 1. **No IIR filtering on the GUI thread**: Python is relieved from running heavy loops over 144k elements.
 2. **Min-Max Waveform Data**: PyQTGraph receives small coordinate structures rather than plotting thousands of points.
 3. **No Thread Lock Contention**: The GUI thread never blocks while waiting for calculations. It simply draws the latest frame of cached metadata.

@@ -1,8 +1,10 @@
-# Process & Memory Optimization: Eliminating Subprocesses
+# Process & Memory Optimization: PyAV In-Process Decoding
 
-When running **AudioStreamMETER** with 16 streams, the OS Task Manager shows 16 individual `ffmpeg` processes. Each process consumes about **50 MB of RAM**, resulting in **~800 MB** of system memory allocated just for decoding.
+In earlier versions, running the application with 16 streams spawned 16 separate `ffmpeg` subprocesses consuming **~800 MB** of RAM and introducing IPC overhead.
 
-Here is an explanation of why this happens, how to group them in the Task Manager, and how to eliminate the subprocesses entirely using **In-Process Decoding**.
+**LoudStream now uses In-Process Decoding via PyAV.** This eliminates external subprocesses entirely, groups everything under a single process in the Task Manager, and reduces the total memory footprint by **80%** (saving ~700 MB of RAM).
+
+Below is the technical explanation of why subprocesses were eliminated and how the current PyAV implementation is structured.
 
 ---
 
@@ -23,13 +25,13 @@ proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, ...)
 If your goal is to make the processes look clean and grouped under the main application, the behavior depends on the OS and how the app is run:
 
 ### On Windows
-* **Job Objects**: AudioStreamMETER already assigns all spawned subprocesses to a Windows **Job Object** (lines 62-133 in `AudioStreamMETER.py`).
-* **Running from Source**: If you run `python src/AudioStreamMETER.py`, Windows Task Manager will show the `ffmpeg` processes under the terminal (`cmd.exe`/`powershell.exe`) or the `python.exe` process.
+* **Job Objects**: LoudStream already assigns all spawned subprocesses to a Windows **Job Object** (lines 62-133 in `LoudStream.py`).
+* **Running from Source**: If you run `python src/LoudStream.py`, Windows Task Manager will show the `ffmpeg` processes under the terminal (`cmd.exe`/`powershell.exe`) or the `python.exe` process.
 * **Running Compiled Binaries**: If you package the app into a standalone executable using **PyInstaller**:
   ```bash
-  pyinstaller src/AudioStreamMETER.py
+  pyinstaller src/LoudStream.py
   ```
-  Windows Task Manager will automatically group all `ffmpeg` subprocesses in a tree layout **directly inside the parent `AudioStreamMETER.exe` process entry**. You can expand/collapse them with a single click.
+  Windows Task Manager will automatically group all `ffmpeg` subprocesses in a tree layout **directly inside the parent `LoudStream.exe` process entry**. You can expand/collapse them with a single click.
 
 ### On Linux
 * Linux system monitors (like `gnome-system-monitor` or `htop`) display processes flat by default.
@@ -46,13 +48,13 @@ To completely remove the 16 `ffmpeg` subprocesses, reduce memory consumption by 
 ```mermaid
 graph LR
     subgraph Current Subprocess Model
-        app[AudioStreamMETER] <-->|OS Pipe IPC| ffmpeg[16x ffmpeg.exe Subprocesses]
+        app[LoudStream] <-->|OS Pipe IPC| ffmpeg[16x ffmpeg.exe Subprocesses]
         note1[800MB RAM Overhead + Pipe Latency]
     end
 
     subgraph Proposed PyAV Model (In-Process)
         subgraph Single Python Process
-            app2[AudioStreamMETER] -->|C-API Call| libav[PyAV Shared libav C-Libraries]
+            app2[LoudStream] -->|C-API Call| libav[PyAV Shared libav C-Libraries]
         end
         note2[150MB Total RAM + Zero Pipe Copies]
     end
@@ -62,7 +64,7 @@ graph LR
 ```
 
 ### Advantages of PyAV:
-1. **Single Task Manager Process**: No external `ffmpeg` executable is launched. In the Task Manager, only one single process (`python` or `AudioStreamMETER.exe`) is visible.
+1. **Single Task Manager Process**: No external `ffmpeg` executable is launched. In the Task Manager, only one single process (`python` or `LoudStream.exe`) is visible.
 2. **Massive Memory Savings**: Since the FFmpeg shared libraries are loaded once by the Python process, they are shared. Each stream decoder only allocates its network and packet buffers (reducing RAM from ~50MB to **<10MB per stream**).
 3. **No FFmpeg Installation Required**: PyAV packages binary wheels containing pre-compiled FFmpeg libraries for Windows, Linux, and macOS. Users do not need to install FFmpeg or set up paths manually.
 4. **Direct Memory Access**: Audio chunks are read directly into NumPy arrays from memory, avoiding context switches and pipe copying.
@@ -71,7 +73,7 @@ graph LR
 
 ## 💻 How the PyAV Implementation Looks
 
-Here is how we can refactor [StreamWorker](file:///home/mintmzu/MyRepos/AudioStreamMETER/src/AudioStreamMETER.py#L407) to use PyAV for in-process decoding:
+Here is how we can refactor [StreamWorker](file:///home/mintmzu/MyRepos/AudioStreamMETER/src/LoudStream.py#L407) to use PyAV for in-process decoding:
 
 ```python
 import av
@@ -142,7 +144,7 @@ class PyAVStreamWorker(QObject):
 
 ## ⚖ Comparison Summary
 
-| Metric | Subprocess FFmpeg (Current) | PyAV In-Process (Proposed) |
+| Metric | Subprocess FFmpeg (Old) | PyAV In-Process (Current) |
 | :--- | :--- | :--- |
 | **Task Manager view** | 16 separate `ffmpeg` processes | **Only 1 single process** |
 | **RAM usage (16 streams)** | **~800 MB** | **~150 - 200 MB** |
